@@ -1,0 +1,31 @@
+# Binaires de build
+/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Sorties de test
+*.test
+*.out
+coverage.*
+
+# Variables d'environnement locales (ex: GITHUB_TOKEN)
+.env
+.env.*
+
+# Fichiers d'éditeur / IDE
+.idea/
+.vscode/
+*.swp
+
+# Fichiers spécifiques macOS
+.DS_Store
+
+# Script local de release (tag + bump de la Formula + push)
+/update.sh
+
+# Local workspace
+/.local/
+
