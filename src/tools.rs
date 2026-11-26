@@ -558,8 +558,12 @@ pub fn urlencoding(input: &str) -> String {
 /// Result of a conditional HTTP GET request (`If-None-Match`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FetchOutcome {
-    /// Upstream returned a `2xx` body and an optional `ETag`.
-    Fetched { body: String, etag: Option<String> },
+    /// Upstream returned a `2xx` body, optional `ETag`, and final resolved URL after redirects.
+    Fetched {
+        body: String,
+        etag: Option<String>,
+        final_url: String,
+    },
     /// Upstream returned `304 Not Modified`; cached body remains valid.
     NotModified { etag: Option<String> },
 }
@@ -588,6 +592,7 @@ pub async fn fetch_url_conditional(
             .await
             .map_err(|err| format!("request failed: {err}"))?;
 
+        let final_url = resp.url().to_string();
         let etag = resp
             .headers()
             .get(reqwest::header::ETAG)
@@ -626,7 +631,11 @@ pub async fn fetch_url_conditional(
 
         let body =
             String::from_utf8(buf).map_err(|err| format!("response is not valid UTF-8: {err}"))?;
-        Ok(FetchOutcome::Fetched { body, etag })
+        Ok(FetchOutcome::Fetched {
+            body,
+            etag,
+            final_url,
+        })
     })
     .await
     .map_err(|_| "request timeout".to_string())?
@@ -813,6 +822,13 @@ fn parse_html_doc(html: &str, source_url: &str, ecosystem: Ecosystem, lib_name: 
         });
     }
 
+    // Extract rustdoc item tables (Modules, Structs, Traits, Macros, Functions, etc.)
+    // so agents can discover submodules (e.g. `module: "sync"`) directly from crate root docs.
+    extract_rustdoc_item_tables(&doc, &mut sections);
+    if !sections.is_empty() {
+        matched_container = true;
+    }
+
     let fallback = if !matched_container || sections.is_empty() {
         clean_inline_text(&doc.root_element())
     } else {
@@ -828,6 +844,101 @@ fn parse_html_doc(html: &str, source_url: &str, ecosystem: Ecosystem, lib_name: 
         fallback,
         source_url: source_url.to_string(),
         lang: ecosystem.as_str().to_string(),
+    }
+}
+
+fn extract_rustdoc_item_tables(doc: &scraper::Html, sections: &mut Vec<DocSection>) {
+    let (Ok(header_sel), Ok(a_sel)) = (
+        scraper::Selector::parse("h2.section-header"),
+        scraper::Selector::parse("a"),
+    ) else {
+        return;
+    };
+
+    for header in doc.select(&header_sel) {
+        let heading = clean_inline_text(&header)
+            .trim_end_matches('§')
+            .trim()
+            .to_string();
+        if heading.is_empty() {
+            continue;
+        }
+
+        // Find the next element sibling; rustdoc places `<dl class="item-table">` right after `<h2>`.
+        let mut sibling = header.next_sibling();
+        let mut table_el = None;
+        while let Some(node) = sibling {
+            if let Some(el) = scraper::ElementRef::wrap(node) {
+                if el.value().name() == "dl"
+                    && el
+                        .value()
+                        .attr("class")
+                        .is_some_and(|c| c.split_whitespace().any(|cls| cls == "item-table"))
+                {
+                    table_el = Some(el);
+                }
+                break;
+            }
+            sibling = node.next_sibling();
+        }
+
+        let Some(dl) = table_el else {
+            continue;
+        };
+
+        let mut items = Vec::new();
+        if heading.eq_ignore_ascii_case("modules") {
+            items.push(
+                "Tip: pass module=\"<name>\" to fetch_docs to read any submodule below."
+                    .to_string(),
+            );
+        }
+
+        let mut pending_name: Option<String> = None;
+        for child in dl.children() {
+            let Some(el) = scraper::ElementRef::wrap(child) else {
+                continue;
+            };
+            match el.value().name() {
+                "dt" => {
+                    if let Some(prev) = pending_name.take() {
+                        items.push(prev);
+                    }
+                    let name = el
+                        .select(&a_sel)
+                        .next()
+                        .map(|a| clean_inline_text(&a))
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| clean_inline_text(&el));
+                    if !name.is_empty() {
+                        pending_name = Some(name);
+                    }
+                }
+                "dd" => {
+                    let desc = clean_inline_text(&el);
+                    if let Some(name) = pending_name.take() {
+                        if desc.is_empty() {
+                            items.push(name);
+                        } else {
+                            items.push(format!("{name}: {desc}"));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(last) = pending_name.take() {
+            items.push(last);
+        }
+
+        if items.len() > usize::from(heading.eq_ignore_ascii_case("modules")) {
+            sections.push(DocSection {
+                title: heading,
+                descriptions: items,
+                codes: Vec::new(),
+                source: None,
+            });
+        }
     }
 }
 
@@ -965,6 +1076,68 @@ pub fn markdown_to_context7(
     markdown_to_context7_with_options(md, summary, source_url, ecosystem, lib_name, None, None)
 }
 
+fn parse_pypi_json_doc(body: &str, fallback_url: &str, lib_name: &str) -> Option<ParsedDoc> {
+    let json = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    let info = &json["info"];
+    let version = info["version"].as_str().unwrap_or("");
+    let summary = info["summary"].as_str().unwrap_or("");
+    let desc = info["description"].as_str().unwrap_or("");
+    let page_url = info["package_url"]
+        .as_str()
+        .filter(|u| !u.is_empty())
+        .unwrap_or(fallback_url);
+
+    let mut parsed = parse_markdown_doc(desc, summary, page_url, Ecosystem::Python, lib_name);
+
+    let mut meta_lines = Vec::new();
+    if !version.is_empty() {
+        meta_lines.push(format!("Resolved PyPI version: {version}"));
+    }
+    if let Some(urls) = info["project_urls"].as_object() {
+        let mut pairs: Vec<(&String, &str)> = urls
+            .iter()
+            .filter_map(|(k, v)| v.as_str().filter(|s| !s.is_empty()).map(|s| (k, s)))
+            .collect();
+        pairs.sort_by(|a, b| a.0.cmp(b.0));
+        for (label, href) in pairs {
+            meta_lines.push(format!("{label}: {href}"));
+        }
+    } else if let Some(home) = info["home_page"].as_str().filter(|s| !s.is_empty()) {
+        meta_lines.push(format!("Homepage: {home}"));
+    }
+
+    if !meta_lines.is_empty() {
+        if let Some(first) = parsed.sections.first_mut() {
+            for line in meta_lines.into_iter().rev() {
+                first.descriptions.insert(0, line);
+            }
+        } else {
+            parsed.sections.push(DocSection {
+                title: format!("{lib_name} Overview"),
+                descriptions: meta_lines,
+                codes: Vec::new(),
+                source: None,
+            });
+        }
+    }
+
+    Some(parsed)
+}
+
+/// Parse a `PyPI` JSON API payload into Context7-style Markdown, surfacing version metadata and
+/// official `project_urls` (such as `Documentation` / `ReadTheDocs` links).
+#[must_use]
+pub fn parse_pypi_json_to_context7(
+    body: &str,
+    fallback_url: &str,
+    lib_name: &str,
+    topic: Option<&str>,
+    max_chars: Option<usize>,
+) -> Option<String> {
+    let parsed = parse_pypi_json_doc(body, fallback_url, lib_name)?;
+    Some(parsed.render(topic, clamp_max_chars(max_chars)))
+}
+
 /// Convert raw Markdown into Context7-style blocks with optional topic filtering and output budget.
 #[must_use]
 pub fn markdown_to_context7_with_options(
@@ -980,37 +1153,85 @@ pub fn markdown_to_context7_with_options(
     parsed.render(topic, clamp_max_chars(max_chars))
 }
 
+fn tokenize_words(text: &str) -> Vec<String> {
+    text.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .filter(|w| !w.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
 fn tokenize_topic(topic: &str) -> Vec<String> {
     let mut tokens = Vec::new();
-    for raw in topic.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_') {
-        let token = raw.to_ascii_lowercase();
-        if !token.is_empty() && !tokens.contains(&token) {
+    for token in tokenize_words(topic) {
+        if !tokens.contains(&token) {
             tokens.push(token);
         }
     }
     tokens
 }
 
+/// Count `(exact_word_hits, prefix_word_hits)` for `token` in `words`.
+/// Prefix matches require `token.len() >= 4` and the candidate word to be strictly longer than
+/// `token` (so `"bounded"` does not spuriously match `"bound"` in `"CPU-bound"`).
+fn count_word_hits(words: &[String], token: &str) -> (usize, usize) {
+    let mut exact = 0_usize;
+    let mut prefix = 0_usize;
+    for word in words {
+        if word == token {
+            exact += 1;
+        } else if token.len() >= 4 && word.starts_with(token) {
+            prefix += 1;
+        }
+    }
+    (exact, prefix)
+}
+
+fn score_line(line: &str, tokens: &[String]) -> usize {
+    let words = tokenize_words(line);
+    let mut score = 0_usize;
+    let mut distinct = 0_usize;
+    for token in tokens {
+        let (exact, prefix) = count_word_hits(&words, token);
+        if exact > 0 || prefix > 0 {
+            distinct += 1;
+            score += exact.min(3) * 6 + prefix.min(2) * 2;
+        }
+    }
+    score + distinct * distinct * 8
+}
+
 fn score_section(section: &DocSection, tokens: &[String]) -> usize {
-    let title_lower = section.title.to_ascii_lowercase();
-    let desc_lower = section.descriptions.join(" ").to_ascii_lowercase();
-    let code_lower = section.codes.join("\n").to_ascii_lowercase();
+    let title_words = tokenize_words(&section.title);
+    let desc_words = tokenize_words(&section.descriptions.join(" "));
+    let code_words = tokenize_words(&section.codes.join("\n"));
 
     let mut score = 0_usize;
+    let mut distinct_matched = 0_usize;
+
     for token in tokens {
-        if title_lower.contains(token) {
-            score += 10;
-        }
-        if code_lower.contains(token) {
-            score += 4;
-        }
-        if desc_lower.contains(token) {
-            score += 2;
+        let (t_exact, t_prefix) = count_word_hits(&title_words, token);
+        let (c_exact, c_prefix) = count_word_hits(&code_words, token);
+        let (d_exact, d_prefix) = count_word_hits(&desc_words, token);
+
+        let token_score = t_exact.min(2) * 25
+            + t_prefix.min(2) * 10
+            + c_exact.min(3) * 8
+            + c_prefix.min(2) * 3
+            + d_exact.min(4) * 5
+            + d_prefix.min(3) * 2;
+
+        if token_score > 0 {
+            distinct_matched += 1;
+            score += token_score;
         }
     }
 
-    if score > 0 && !section.codes.is_empty() {
-        score += 3;
+    if score > 0 {
+        // Strongly reward sections covering multiple distinct query terms.
+        score += distinct_matched * distinct_matched * 15;
+        if !section.codes.is_empty() {
+            score += 4;
+        }
     }
     score
 }
@@ -1115,23 +1336,57 @@ fn format_sections_all(
         let mut block = String::new();
         let _ = writeln!(block, "TITLE: {}", section.title);
         if !section.descriptions.is_empty() {
-            let desc_joined = section
-                .descriptions
-                .iter()
-                .take(4)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(" ");
-            let _ = writeln!(block, "DESCRIPTION: {}", truncate_smart(&desc_joined, 450));
+            // When filtering by topic on a long section (e.g. llms.txt link lists or module
+            // tables), surface matching lines first instead of keeping only the first 4 lines.
+            let selected_lines: Vec<&str> = if !tokens.is_empty() && section.descriptions.len() > 4
+            {
+                let mut scored_lines: Vec<(usize, usize, &str)> = section
+                    .descriptions
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, line)| {
+                        let s = score_line(line, &tokens);
+                        (s > 0).then_some((s, idx, line.as_str()))
+                    })
+                    .collect();
+                if scored_lines.is_empty() {
+                    section.descriptions.iter().map(String::as_str).collect()
+                } else {
+                    scored_lines.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+                    scored_lines.into_iter().map(|(_, _, line)| line).collect()
+                }
+            } else {
+                section.descriptions.iter().map(String::as_str).collect()
+            };
+
+            let desc_joined = selected_lines.join("\n");
+            let _ = writeln!(block, "DESCRIPTION:\n{desc_joined}");
         }
         let src = section.source.as_deref().unwrap_or(default_source);
         let _ = writeln!(block, "SOURCE: {src}");
         let _ = writeln!(block, "LANGUAGE: {lang}");
 
         if !section.codes.is_empty() {
+            let selected_codes: Vec<&str> = if !tokens.is_empty() && section.codes.len() > 2 {
+                let mut scored_codes: Vec<(usize, usize, &str)> = section
+                    .codes
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, code)| (score_line(code, &tokens), idx, code.as_str()))
+                    .collect();
+                scored_codes.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+                scored_codes
+                    .into_iter()
+                    .take(3)
+                    .map(|(_, _, code)| code)
+                    .collect()
+            } else {
+                section.codes.iter().take(3).map(String::as_str).collect()
+            };
+
             block.push_str("CODE:\n");
-            for code in section.codes.iter().take(2) {
-                let _ = writeln!(block, "```{lang}\n{}\n```", truncate_smart(code, 1200));
+            for code in selected_codes {
+                let _ = writeln!(block, "```{lang}\n{code}\n```");
             }
         }
         block.push_str("----------------------------------------\n\n");
@@ -1427,18 +1682,25 @@ impl FastDocsServer {
         version: &str,
     ) -> Result<(ParsedDoc, Option<String>), String> {
         let lower_url = format!("https://unpkg.com/{library}@{version}/readme.md");
-        if let Ok(FetchOutcome::Fetched { body, etag }) =
-            self.fetch_allowlisted_conditional(&lower_url, None).await
+        if let Ok(FetchOutcome::Fetched {
+            body,
+            etag,
+            final_url,
+        }) = self.fetch_allowlisted_conditional(&lower_url, None).await
         {
             return Ok((
-                parse_markdown_doc(&body, "", &lower_url, Ecosystem::Npm, library),
+                parse_markdown_doc(&body, "", &final_url, Ecosystem::Npm, library),
                 etag,
             ));
         }
 
         let encoded_pkg = library.replace('/', "%2F");
         let registry_url = format!("https://registry.npmjs.org/{encoded_pkg}");
-        let FetchOutcome::Fetched { body, etag } = self
+        let FetchOutcome::Fetched {
+            body,
+            etag,
+            final_url,
+        } = self
             .fetch_allowlisted_conditional(&registry_url, None)
             .await?
         else {
@@ -1451,7 +1713,7 @@ impl FastDocsServer {
         let page_url = json["homepage"]
             .as_str()
             .filter(|u| !u.is_empty())
-            .unwrap_or(&registry_url);
+            .unwrap_or(&final_url);
         Ok((
             parse_markdown_doc(readme, summary, page_url, Ecosystem::Npm, library),
             etag,
@@ -1598,31 +1860,21 @@ impl FastDocsServer {
                     ecosystem.as_str()
                 ))]))
             }
-            Ok(FetchOutcome::Fetched { body, etag }) => {
+            Ok(FetchOutcome::Fetched {
+                body,
+                etag,
+                final_url,
+            }) => {
                 let parsed = match ecosystem {
-                    Ecosystem::Python => {
-                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
-                            let info = &json["info"];
-                            let summary = info["summary"].as_str().unwrap_or("");
-                            let desc = info["description"].as_str().unwrap_or("");
-                            let page_url =
-                                info["package_url"].as_str().unwrap_or("https://pypi.org");
-                            parse_markdown_doc(
-                                desc,
-                                summary,
-                                page_url,
-                                Ecosystem::Python,
-                                &req.library,
-                            )
-                        } else {
-                            parse_html_doc(&body, &url, ecosystem, &req.library)
-                        }
-                    }
+                    Ecosystem::Python => parse_pypi_json_doc(&body, &final_url, &req.library)
+                        .unwrap_or_else(|| {
+                            parse_html_doc(&body, &final_url, ecosystem, &req.library)
+                        }),
                     Ecosystem::Npm => {
-                        parse_markdown_doc(&body, "", &url, Ecosystem::Npm, &req.library)
+                        parse_markdown_doc(&body, "", &final_url, Ecosystem::Npm, &req.library)
                     }
                     Ecosystem::Rust | Ecosystem::Go => {
-                        parse_html_doc(&body, &url, ecosystem, &req.library)
+                        parse_html_doc(&body, &final_url, ecosystem, &req.library)
                     }
                 };
 
@@ -1899,11 +2151,15 @@ impl FastDocsServer {
                     "llms.txt not available for {host}: empty revalidated cache"
                 ))]))
             }
-            Ok(FetchOutcome::Fetched { body, etag }) => {
+            Ok(FetchOutcome::Fetched {
+                body,
+                etag,
+                final_url: resolved_url,
+            }) => {
                 let parsed = ParsedDoc {
                     sections: parse_markdown_sections(&body, "", "", &host),
                     fallback: String::new(),
-                    source_url: final_url.clone(),
+                    source_url: resolved_url.clone(),
                     lang: "markdown".to_string(),
                 };
                 if let Some(cache) = &self.cache {
@@ -1916,8 +2172,13 @@ impl FastDocsServer {
                     }
                 }
                 let rendered = parsed.render_paginated(req.topic.as_deref(), max_chars, offset);
+                let hint = if !want_full && resolved_url.ends_with("/llms.txt") {
+                    "\n\nTip: pass full=true to fetch /llms-full.txt for complete documentation text."
+                } else {
+                    ""
+                };
                 Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                    "# {host} ({final_url})\n\n{rendered}"
+                    "# {host} ({resolved_url})\n\n{rendered}{hint}"
                 ))]))
             }
             Err(err) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(

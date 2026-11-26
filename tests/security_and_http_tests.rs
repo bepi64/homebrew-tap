@@ -423,7 +423,52 @@ async fn fetch_conditional_extracts_etag_on_200_ok() {
             Ok(FetchOutcome::Fetched {
                 body: "hello".to_string(),
                 etag: Some("\"abc123\"".to_string()),
+                final_url: url,
             })
         );
     }
+}
+
+#[tokio::test]
+async fn fetch_conditional_reports_resolved_final_url_after_redirect() {
+    let Ok(listener) = TcpListener::bind("127.0.0.1:0").await else {
+        return;
+    };
+    let Ok(addr) = listener.local_addr() else {
+        return;
+    };
+
+    tokio::spawn(async move {
+        for _ in 0..2 {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0_u8; 2048];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let req_text = String::from_utf8_lossy(&buf[..n]);
+                let response = if req_text.starts_with("GET /zod@latest/README.md ") {
+                    b"HTTP/1.1 302 Found\r\nLocation: /zod@4.6.7/README.md\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_vec()
+                } else {
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nzod docs"
+                        .to_vec()
+                };
+                let _ = socket.write_all(&response).await;
+                let _ = socket.shutdown().await;
+            }
+        }
+    });
+
+    let start_url = format!("http://{addr}/zod@latest/README.md");
+    let expected_final = format!("http://{addr}/zod@4.6.7/README.md");
+    let client = reqwest::Client::new();
+
+    let outcome =
+        fetch_url_conditional(&client, &start_url, None, Duration::from_secs(2), 4096).await;
+    assert_eq!(
+        outcome,
+        Ok(FetchOutcome::Fetched {
+            body: "zod docs".to_string(),
+            etag: None,
+            final_url: expected_final,
+        })
+    );
 }

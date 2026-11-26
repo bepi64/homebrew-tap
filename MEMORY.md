@@ -96,6 +96,11 @@ Architecture Decision Records (ADRs) and open questions for `fast-docs` (`homebr
 - **Decision:** Add `src/extractors.rs` backed by `zip 9.8.2` (`deflate`-only, MIT) and `pdf-extract 0.12.1` (MIT) to extract `.ipynb`, `.docx`, `.pptx`, `.xlsx`, `.odt`, `.odp`, `.ods`, `.epub`, and `.pdf` inside `fetch_local_docs`, and allow the `Zlib` license in `deny.toml` for `zlib-rs`.
 - **Rationale:** Achieves full document-format parity with `docs-mcp-server` in a single pure-Rust binary with zero external runtimes. Security is enforced via a 5 MiB raw file cap, 200-entry archive cap, `Read::take`-enforced 2 MiB decompressed cap (anti-zip-bomb), entity-safe XML text extraction without DTD expansion (anti-XXE), and `std::panic::catch_unwind` isolation around third-party PDF parsing so corrupted PDFs never terminate the MCP server.
 
+### D-16: Word-Boundary Multi-Term Topic Ranking, Intra-Section Filtering, Rustdoc Tables, and Resolved `final_url`
+- **Status:** Accepted (2026-11-26)
+- **Decision:** Replace binary substring topic matching and hard per-section `.take(4)` / 450-char truncation with word-boundary multi-term scoring (`count_word_hits` + quadratic distinct-term coverage bonus), intra-section line/code filtering when `topic` is set, rustdoc `h2.section-header` + `dl.item-table` extraction, PyPI `project_urls` surfacing (`parse_pypi_json_doc`), and resolved `final_url` capture in `FetchOutcome::Fetched`.
+- **Rationale:** Real-world testing against `tokio`, `hono.dev/llms.txt`, `requests`, and `zod` exposed that `.take(4)` + 450-char truncation discarded deep matching lines (such as `routing` in `hono.dev/llms.txt`) and produced pervasive `... (truncated)` markers well below the 6,500-char budget, while `@latest` redirects hid the actual served version (`zod@4.6.7`, `tokio/1.54.1`).
+
 ## Open Questions
 
 - **Q-01 (v1.0.0 release publication):** `Cargo.toml` and `USER_AGENT` are now at `1.0.0`. Once pushed to GitHub (`https://github.com/bepi64/homebrew-tap`) and tagged `v1.0.0`, replace the placeholder `sha256` in `Formula/fast-docs.rb` with the real release archive checksum, then run `brew audit --strict --new Formula/fast-docs.rb`, `brew install --build-from-source Formula/fast-docs.rb`, and `brew test fast-docs`.

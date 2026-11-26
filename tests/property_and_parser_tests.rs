@@ -1,8 +1,10 @@
+use std::fmt::Write as _;
+
 use fast_docs::tools::{
     clamp_max_chars, detect_lang, html_to_context7, html_to_context7_with_options,
-    markdown_to_context7, markdown_to_context7_with_options, resolve_go_module,
-    slice_with_pagination, strip_html_tags, truncate_smart, urlencoding, Ecosystem,
-    MAX_ALLOWED_OUTPUT_CHARS, MAX_OUTPUT_CHARS, MIN_OUTPUT_CHARS,
+    markdown_to_context7, markdown_to_context7_with_options, parse_pypi_json_to_context7,
+    resolve_go_module, slice_with_pagination, strip_html_tags, truncate_smart, urlencoding,
+    Ecosystem, MAX_ALLOWED_OUTPUT_CHARS, MAX_OUTPUT_CHARS, MIN_OUTPUT_CHARS,
 };
 use proptest::prelude::*;
 
@@ -190,6 +192,143 @@ fn slice_with_pagination_supports_multi_page_reading_and_bounds() {
 
     let past_end = slice_with_pagination(doc, 999, 20);
     assert!(past_end.contains("exceeds document length"));
+}
+
+#[test]
+fn topic_filtering_surfaces_deep_matching_lines_without_450_char_truncation() {
+    let mut md = String::from("## Optional\n");
+    for i in 1..=15 {
+        let _ = writeln!(
+            md,
+            "- [Unrelated Helper {i}](https://hono.dev/docs/helpers/h{i}): helper description number {i} with extra padding text."
+        );
+    }
+    md.push_str(
+        "- [Routing API](https://hono.dev/docs/api/routing): Fast RegExpRouter for HTTP routing.\n",
+    );
+    md.push_str("- [Middleware Guide](https://hono.dev/docs/guides/middleware): Composable async middleware pipeline.\n");
+
+    let rendered = markdown_to_context7_with_options(
+        &md,
+        "",
+        "https://hono.dev/llms.txt",
+        Ecosystem::Npm,
+        "hono",
+        Some("routing middleware"),
+        Some(6500),
+    );
+
+    assert!(
+        rendered.contains("https://hono.dev/docs/api/routing"),
+        "deep matching routing line must not be dropped by .take(4): {rendered}"
+    );
+    assert!(
+        rendered.contains("https://hono.dev/docs/guides/middleware"),
+        "deep matching middleware line must appear: {rendered}"
+    );
+    assert!(
+        !rendered.contains("... (truncated)"),
+        "short matching output within 6500 budget must not be truncated at 450 chars: {rendered}"
+    );
+}
+
+#[test]
+fn topic_ranking_prefers_multi_term_word_boundary_matches_over_single_substring() {
+    let md = "\
+# CPU-bound tasks and blocking code
+Offload CPU-bound computations using spawn_blocking so worker threads stay responsive.
+# Bounded mpsc channel
+Create a bounded mpsc channel for backpressure between async producer and consumer tasks.
+```rust
+let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+```
+";
+
+    let rendered = markdown_to_context7_with_options(
+        md,
+        "",
+        "https://docs.rs/tokio/latest",
+        Ecosystem::Rust,
+        "tokio",
+        Some("mpsc channel bounded"),
+        Some(6500),
+    );
+
+    let channel_pos = rendered.find("TITLE: Bounded mpsc channel");
+    assert!(
+        channel_pos.is_some(),
+        "expected Bounded mpsc channel section: {rendered}"
+    );
+    if let Some(cpu_pos) = rendered.find("TITLE: CPU-bound tasks") {
+        assert!(channel_pos < Some(cpu_pos));
+    }
+}
+
+#[test]
+fn html_to_context7_extracts_rustdoc_module_tables() {
+    let rustdoc_html = r##"
+    <html><body><main><section id="main-content">
+      <div class="docblock">
+        <h1>Tokio</h1>
+        <p>An event-driven, non-blocking I/O platform for writing asynchronous applications.</p>
+      </div>
+      <h2 id="modules" class="section-header">Modules<a href="#modules" class="anchor">§</a></h2>
+      <dl class="item-table">
+        <dt><a class="mod" href="sync/index.html">sync</a></dt>
+        <dd>Synchronization primitives for use in asynchronous contexts.</dd>
+        <dt><a class="mod" href="net/index.html">net</a></dt>
+        <dd>TCP/UDP/Unix bindings for tokio.</dd>
+      </dl>
+    </section></main></body></html>
+    "##;
+
+    let rendered = html_to_context7_with_options(
+        rustdoc_html,
+        "https://docs.rs/tokio/1.54.1/tokio/",
+        Ecosystem::Rust,
+        "tokio",
+        Some("sync synchronization"),
+        Some(6500),
+    );
+
+    assert!(
+        rendered.contains("TITLE: Modules"),
+        "rustdoc Modules table must be extracted: {rendered}"
+    );
+    assert!(
+        rendered.contains("sync: Synchronization primitives"),
+        "module entry and description must appear: {rendered}"
+    );
+}
+
+#[test]
+fn pypi_json_includes_official_documentation_project_urls() {
+    let pypi_json = r##"{
+      "info": {
+        "name": "requests",
+        "version": "2.32.3",
+        "summary": "Python HTTP for Humans.",
+        "package_url": "https://pypi.org/project/requests/",
+        "project_urls": {
+          "Documentation": "https://requests.readthedocs.io",
+          "Source": "https://github.com/psf/requests"
+        },
+        "description": "# Requests\nSimple HTTP library for Python."
+      }
+    }"##;
+
+    let rendered = parse_pypi_json_to_context7(
+        pypi_json,
+        "https://pypi.org/pypi/requests/json",
+        "requests",
+        None,
+        None,
+    );
+    assert!(rendered.is_some());
+    if let Some(text) = rendered {
+        assert!(text.contains("https://requests.readthedocs.io"));
+        assert!(text.contains("2.32.3"));
+    }
 }
 
 proptest! {
