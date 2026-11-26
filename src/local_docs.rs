@@ -11,8 +11,9 @@ use crate::tools::{
 const MAX_DEPTH: usize = 6;
 const MAX_LOCAL_FILES: usize = 200;
 
-const IGNORED_DIRS: [&str; 12] = [
+const IGNORED_DIRS: [&str; 13] = [
     ".git",
+    ".github",
     ".ssh",
     ".gnupg",
     ".trash",
@@ -25,6 +26,33 @@ const IGNORED_DIRS: [&str; 12] = [
     "dist",
     "build",
 ];
+
+fn local_doc_priority(rel_path: &str) -> u8 {
+    let lower = rel_path.to_ascii_lowercase();
+    let file_name = Path::new(&lower)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(&lower);
+    if file_name.starts_with("changelog")
+        || file_name.starts_with("history")
+        || file_name.starts_with("changes")
+    {
+        return 5;
+    }
+    if file_name.starts_with("migration") {
+        return 4;
+    }
+    if file_name.starts_with("contributing") {
+        return 3;
+    }
+    if !lower.contains('/') && file_name.starts_with("readme") {
+        return 0;
+    }
+    if lower.starts_with("docs/") || lower.starts_with("doc/") || lower.starts_with("site/") {
+        return 1;
+    }
+    2
+}
 
 const FORBIDDEN_SECRET_EXTENSIONS: [&str; 5] = ["pem", "key", "p12", "pfx", "kdbx"];
 
@@ -138,6 +166,21 @@ pub fn search_local_docs(
             root.display()
         ));
     }
+
+    // Prioritize README.md and docs/ ahead of CONTRIBUTING.md, MIGRATION.md, and CHANGELOG.md.
+    files.sort_by(|a, b| {
+        let rel_a = a
+            .strip_prefix(&canonical_root)
+            .unwrap_or(a)
+            .to_string_lossy();
+        let rel_b = b
+            .strip_prefix(&canonical_root)
+            .unwrap_or(b)
+            .to_string_lossy();
+        local_doc_priority(&rel_a)
+            .cmp(&local_doc_priority(&rel_b))
+            .then_with(|| rel_a.cmp(&rel_b))
+    });
 
     let mut all_sections: Vec<DocSection> = Vec::new();
     for file in &files {

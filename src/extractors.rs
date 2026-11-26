@@ -198,6 +198,7 @@ fn lines_to_sections(text: &str, default_title: &str, rel_path: &str) -> Vec<Doc
         title: default_title.to_string(),
         descriptions,
         codes: Vec::new(),
+        code_langs: Vec::new(),
         source: Some(rel_path.to_string()),
     }]
 }
@@ -213,6 +214,7 @@ fn extract_ipynb_sections(raw: &str, rel_path: &str) -> Result<Vec<DocSection>, 
     let mut cur_title = format!("{rel_path} Notebook");
     let mut cur_desc: Vec<String> = Vec::new();
     let mut cur_code: Vec<String> = Vec::new();
+    let mut cur_code_langs: Vec<Option<String>> = Vec::new();
 
     for cell in cells {
         let cell_type = cell["cell_type"].as_str().unwrap_or("");
@@ -234,17 +236,20 @@ fn extract_ipynb_sections(raw: &str, rel_path: &str) -> Result<Vec<DocSection>, 
                         title: cur_title.clone(),
                         descriptions: std::mem::take(&mut cur_desc),
                         codes: std::mem::take(&mut cur_code),
+                        code_langs: std::mem::take(&mut cur_code_langs),
                         source: Some(rel_path.to_string()),
                     });
                 }
                 cur_title = sec.title;
                 cur_desc = sec.descriptions;
                 cur_code = sec.codes;
+                cur_code_langs = sec.code_langs;
             }
         } else if cell_type == "code" {
             let trimmed = source_text.trim();
             if !trimmed.is_empty() {
                 cur_code.push(trimmed.to_string());
+                cur_code_langs.push(Some("python".to_string()));
             }
         }
     }
@@ -254,6 +259,7 @@ fn extract_ipynb_sections(raw: &str, rel_path: &str) -> Result<Vec<DocSection>, 
             title: cur_title,
             descriptions: cur_desc,
             codes: cur_code,
+            code_langs: cur_code_langs,
             source: Some(rel_path.to_string()),
         });
     }

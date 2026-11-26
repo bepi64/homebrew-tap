@@ -108,3 +108,73 @@ fn search_local_docs_rejects_missing_directory() {
     let missing = unique_dir("missing");
     assert!(search_local_docs(&missing, None, 2000, 0).is_err());
 }
+
+#[test]
+fn search_local_docs_prioritizes_readme_docs_indexes_paths_and_skips_templates() {
+    let dir = unique_dir("priority");
+    assert!(fs::create_dir_all(dir.join(".github/ISSUE_TEMPLATE")).is_ok());
+    assert!(fs::create_dir_all(dir.join("docs")).is_ok());
+
+    assert!(fs::write(
+        dir.join(".github/ISSUE_TEMPLATE/bug.md"),
+        "# Bug Report\nTemplate noise that should never appear.\n"
+    )
+    .is_ok());
+    assert!(fs::write(
+        dir.join("CHANGELOG.md"),
+        "# 0.9.0\nFixed timeouts bug in legacy client timeouts handler.\n"
+    )
+    .is_ok());
+    assert!(fs::write(
+        dir.join("README.md"),
+        "# Main Project\nPrimary project overview documentation.\n"
+    )
+    .is_ok());
+    assert!(fs::write(
+        dir.join("docs/CONTRIBUTING.md"),
+        "# Contribution Guide\nHow to run tests and open pull requests.\n"
+    )
+    .is_ok());
+    assert!(fs::write(
+        dir.join("docs/timeouts.md"),
+        "# Timeouts\nConfigure connect and read timeouts cleanly.\n"
+    )
+    .is_ok());
+
+    // 1. Without topic: README.md precedes CHANGELOG.md and .github templates are excluded
+    let overview = search_local_docs(&dir, None, 4000, 0);
+    assert!(overview.is_ok());
+    if let Ok(text) = overview {
+        assert!(!text.contains("Template noise"));
+        let readme_pos = text.find("SOURCE: README.md");
+        let changelog_pos = text.find("SOURCE: CHANGELOG.md");
+        assert!(readme_pos.is_some());
+        if let Some(cl_pos) = changelog_pos {
+            assert!(readme_pos < Some(cl_pos));
+        }
+    }
+
+    // 2. Topic matching filename path finds docs/CONTRIBUTING.md
+    let contrib = search_local_docs(&dir, Some("CONTRIBUTING"), 2000, 0);
+    assert!(contrib.is_ok());
+    if let Ok(text) = contrib {
+        assert!(
+            text.contains("SOURCE: docs/CONTRIBUTING.md"),
+            "filename path must be indexed by topic search: {text}"
+        );
+    }
+
+    // 3. Real docs rank ahead of CHANGELOG.md on topic queries
+    let timeouts = search_local_docs(&dir, Some("timeouts"), 4000, 0);
+    assert!(timeouts.is_ok());
+    if let Ok(text) = timeouts {
+        let doc_pos = text.find("SOURCE: docs/timeouts.md");
+        let cl_pos = text.find("SOURCE: CHANGELOG.md");
+        assert!(doc_pos.is_some());
+        if let Some(c) = cl_pos {
+            assert!(doc_pos < Some(c));
+        }
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}

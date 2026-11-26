@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::cache::{DiskCache, DEFAULT_CACHE_TTL, PINNED_CACHE_TTL, SEARCH_CACHE_TTL};
 use crate::llms_txt::{build_llms_txt_url, fetch_llms_with_safe_redirects};
 use crate::local_docs::search_local_docs;
-use crate::manifest::{detect_project_ecosystem, resolve_project_version};
+use crate::manifest::{detect_project_ecosystem, resolve_go_short_name, resolve_project_version};
 
 /// Minimum configurable output budget for `fetch_docs`.
 pub const MIN_OUTPUT_CHARS: usize = 500;
@@ -99,6 +99,22 @@ impl Ecosystem {
     }
 }
 
+/// Parse an optional `lang` argument strictly, returning `Err` on unknown/misspelled values
+/// instead of silently falling back to auto-detection.
+///
+/// # Errors
+/// Returns an error listing valid ecosystems when `raw` is non-empty and unrecognized.
+pub fn parse_ecosystem_arg(raw: Option<&str>) -> Result<Option<Ecosystem>, String> {
+    let Some(value) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    Ecosystem::parse(value).map(Some).ok_or_else(|| {
+        format!(
+            "invalid lang '{value}': expected one of rust, python, go, or npm (aliases: rs, py, golang, js, ts, node)"
+        )
+    })
+}
+
 /// Scope selector for `search_docs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SearchScope {
@@ -107,14 +123,16 @@ enum SearchScope {
 }
 
 impl SearchScope {
-    fn from_opt(raw: Option<&str>) -> Self {
-        let Some(value) = raw else {
-            return Self::All;
+    fn parse_arg(raw: Option<&str>) -> Result<Self, String> {
+        let Some(value) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+            return Ok(Self::All);
         };
-        if value.trim().eq_ignore_ascii_case("all") {
-            return Self::All;
+        if value.eq_ignore_ascii_case("all") {
+            return Ok(Self::All);
         }
-        Ecosystem::parse(value).map_or(Self::All, Self::Only)
+        Ecosystem::parse(value).map(Self::Only).ok_or_else(|| {
+            format!("invalid lang '{value}': expected one of rust, python, go, npm, or all")
+        })
     }
 
     const fn as_key(self) -> &'static str {
@@ -340,15 +358,64 @@ fn validate_parsed_url(parsed: &Url) -> Result<(), String> {
     Ok(())
 }
 
+fn looks_like_go_import_path(lower: &str) -> bool {
+    if lower.starts_with('@') {
+        return false;
+    }
+    if let Some((first_seg, _rest)) = lower.split_once('/') {
+        // Vanity domain import (e.g. github.com/..., go.yaml.in/..., gopkg.in/..., k8s.io/...)
+        if first_seg.contains('.') && !first_seg.starts_with('.') && !first_seg.ends_with('.') {
+            return true;
+        }
+        // Standard Go stdlib multi-segment packages (net/http, encoding/json, crypto/tls, ...)
+        let go_stdlib_roots = [
+            "archive",
+            "bufio",
+            "compress",
+            "container",
+            "crypto",
+            "database",
+            "debug",
+            "encoding",
+            "go",
+            "hash",
+            "html",
+            "image",
+            "index",
+            "io",
+            "log",
+            "math",
+            "mime",
+            "net",
+            "os",
+            "path",
+            "plugin",
+            "reflect",
+            "regexp",
+            "runtime",
+            "sync",
+            "syscall",
+            "testing",
+            "text",
+            "time",
+            "unicode",
+        ];
+        if go_stdlib_roots.contains(&first_seg) {
+            return true;
+        }
+    }
+    let go_stdlib_single = [
+        "fmt", "strings", "bytes", "context", "errors", "strconv", "sort", "slices", "maps",
+        "filepath",
+    ];
+    go_stdlib_single.contains(&lower)
+}
+
 /// Detect the most likely documentation ecosystem for a library identifier.
 #[must_use]
 pub fn detect_lang(library: &str) -> Ecosystem {
     let lower = library.to_ascii_lowercase();
-    if lower.contains("github.com/")
-        || lower.contains("golang.org/")
-        || lower.contains("gorm.io/")
-        || lower.contains("go.uber.org/")
-    {
+    if looks_like_go_import_path(&lower) {
         return Ecosystem::Go;
     }
 
@@ -676,6 +743,8 @@ pub struct DocSection {
     pub descriptions: Vec<String>,
     pub codes: Vec<String>,
     #[serde(default)]
+    pub code_langs: Vec<Option<String>>,
+    #[serde(default)]
     pub source: Option<String>,
 }
 
@@ -703,35 +772,18 @@ impl ParsedDoc {
 
         if self.sections.is_empty() {
             let combined = format!("{prefix}{}", self.fallback);
-            if offset > 0 {
-                return slice_with_pagination(&combined, offset, max_chars);
-            }
-            return truncate_smart(&combined, max_chars);
+            return slice_with_pagination(&combined, offset, max_chars);
         }
 
-        if offset > 0 {
-            let full = format!(
-                "{prefix}{}",
-                format_sections_all(
-                    &self.sections,
-                    &self.source_url,
-                    &self.lang,
-                    topic,
-                    256 * 1024,
-                )
-            );
-            return slice_with_pagination(&full, offset, max_chars);
-        }
-
-        let body_budget = max_chars.saturating_sub(prefix.len());
-        let body = render_context7_sections(
+        let body = format_sections_all(
             &self.sections,
             &self.source_url,
             &self.lang,
             topic,
-            body_budget,
+            256 * 1024,
         );
-        truncate_smart(&format!("{prefix}{body}"), max_chars)
+        let full = format!("{prefix}{body}");
+        slice_with_pagination(&full, offset, max_chars)
     }
 }
 
@@ -751,6 +803,7 @@ pub(crate) fn parse_html_sections(
             title: format!("{lib_name} Overview"),
             descriptions: vec![fallback.to_string()],
             codes: Vec::new(),
+            code_langs: Vec::new(),
             source: source_opt,
         }];
     }
@@ -764,81 +817,118 @@ pub(crate) fn parse_html_sections(
         .collect()
 }
 
-fn parse_html_doc(html: &str, source_url: &str, ecosystem: Ecosystem, lib_name: &str) -> ParsedDoc {
-    let doc = scraper::Html::parse_document(html);
+fn clean_heading_text(raw: &str) -> String {
+    strip_html_tags(raw)
+        .trim_start_matches('§')
+        .trim_end_matches(['§', '¶'])
+        .replace('¶', "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
-    let container_selectors = [
-        "div.docblock",              // docs.rs / rustdoc
-        "div.UnitReadme-content",    // pkg.go.dev README
-        "div.Documentation-content", // pkg.go.dev API docs
-        "div.project-description",   // pypi.org HTML fallback
-        "article",
-        "main",
-    ];
+fn clean_code_signature(raw: &str) -> String {
+    raw.trim_start_matches('§')
+        .trim_end_matches(['§', '¶'])
+        .replace('¶', "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
-    let Ok(children_selector) = scraper::Selector::parse("h1, h2, h3, h4, p, li, pre") else {
-        return ParsedDoc {
-            sections: Vec::new(),
-            fallback: clean_inline_text(&doc.root_element()),
-            source_url: source_url.to_string(),
-            lang: ecosystem.as_str().to_string(),
-            metadata: Vec::new(),
-        };
-    };
-
-    let mut sections: Vec<DocSection> = Vec::new();
-    let mut cur_title = format!("{lib_name} Overview");
-    let mut cur_desc: Vec<String> = Vec::new();
-    let mut cur_code: Vec<String> = Vec::new();
-    let mut matched_container = false;
-
-    for sel_str in &container_selectors {
-        let Ok(sel) = scraper::Selector::parse(sel_str) else {
-            continue;
-        };
-        let containers: Vec<_> = doc.select(&sel).collect();
-        if containers.is_empty() {
-            continue;
+fn extract_clean_code_block(pre: &scraper::ElementRef<'_>) -> String {
+    // Rustdoc wraps code inside `<pre><code>` alongside optional `<span class="line-numbers">`.
+    if let Ok(code_sel) = scraper::Selector::parse("code") {
+        if let Some(code_el) = pre.select(&code_sel).next() {
+            let txt = code_el.text().collect::<String>().trim().to_string();
+            if !txt.is_empty() {
+                return txt;
+            }
         }
-        matched_container = true;
-        for container in containers {
-            for el in container.select(&children_selector) {
-                match el.value().name() {
-                    "h1" | "h2" | "h3" | "h4" => {
-                        if !cur_desc.is_empty() || !cur_code.is_empty() {
-                            sections.push(DocSection {
-                                title: cur_title.clone(),
-                                descriptions: std::mem::take(&mut cur_desc),
-                                codes: std::mem::take(&mut cur_code),
-                                source: None,
-                            });
-                        }
-                        let heading = clean_inline_text(&el)
-                            .trim_start_matches('§')
-                            .trim()
-                            .to_string();
-                        if !heading.is_empty() {
-                            cur_title = heading;
-                        }
-                    }
-                    "pre" => {
-                        let code = el.text().collect::<String>().trim().to_string();
-                        if !code.is_empty() {
-                            cur_code.push(code);
-                        }
-                    }
-                    "p" | "li" => {
-                        let txt = clean_inline_text(&el);
-                        if txt.len() > 15 && !cur_desc.contains(&txt) {
-                            cur_desc.push(txt);
-                        }
-                    }
-                    _ => {}
+    }
+    pre.text().collect::<String>().trim().to_string()
+}
+
+fn has_nested_list_items(li: &scraper::ElementRef<'_>) -> bool {
+    scraper::Selector::parse("li").is_ok_and(|sel| li.select(&sel).next().is_some())
+}
+
+fn clean_html_fallback(doc: &scraper::Html) -> String {
+    let mut parts = Vec::new();
+    let root = doc.root_element();
+    if let Ok(body_sel) = scraper::Selector::parse("body") {
+        let scope = doc.select(&body_sel).next().unwrap_or(root);
+        for desc in scope.descendants() {
+            if let Some(txt) = desc.value().as_text() {
+                let in_ignored = desc.ancestors().any(|anc| {
+                    anc.value().as_element().is_some_and(|el| {
+                        matches!(el.name(), "script" | "style" | "noscript" | "template")
+                    })
+                });
+                if in_ignored {
+                    continue;
+                }
+                let cleaned = txt.split_whitespace().collect::<Vec<_>>().join(" ");
+                if !cleaned.is_empty() {
+                    parts.push(cleaned);
                 }
             }
         }
-        if !sections.is_empty() || !cur_desc.is_empty() || !cur_code.is_empty() {
-            break;
+    }
+    parts.join(" ")
+}
+
+fn parse_container_elements(
+    container: &scraper::ElementRef<'_>,
+    children_selector: &scraper::Selector,
+    default_title: &str,
+    sections: &mut Vec<DocSection>,
+) {
+    let mut cur_title = default_title.to_string();
+    let mut cur_desc: Vec<String> = Vec::new();
+    let mut cur_code: Vec<String> = Vec::new();
+    let mut cur_code_langs: Vec<Option<String>> = Vec::new();
+
+    for el in container.select(children_selector) {
+        match el.value().name() {
+            "h1" | "h2" | "h3" | "h4" => {
+                if !cur_desc.is_empty() || !cur_code.is_empty() {
+                    sections.push(DocSection {
+                        title: cur_title.clone(),
+                        descriptions: std::mem::take(&mut cur_desc),
+                        codes: std::mem::take(&mut cur_code),
+                        code_langs: std::mem::take(&mut cur_code_langs),
+                        source: None,
+                    });
+                }
+                let heading = clean_heading_text(&clean_inline_text(&el));
+                if !heading.is_empty() {
+                    cur_title = heading;
+                }
+            }
+            "pre" => {
+                let code = extract_clean_code_block(&el);
+                if !code.is_empty() {
+                    cur_code.push(code);
+                    cur_code_langs.push(None);
+                }
+            }
+            "p" => {
+                let txt = clean_inline_text(&el);
+                if txt.len() > 15 && !cur_desc.contains(&txt) {
+                    cur_desc.push(txt);
+                }
+            }
+            "li" => {
+                // Skip outer <li> wrappers that contain nested <li> elements to prevent duplication.
+                if !has_nested_list_items(&el) {
+                    let txt = clean_inline_text(&el);
+                    if txt.len() > 15 && !cur_desc.contains(&txt) {
+                        cur_desc.push(txt);
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -847,19 +937,149 @@ fn parse_html_doc(html: &str, source_url: &str, ecosystem: Ecosystem, lib_name: 
             title: cur_title,
             descriptions: cur_desc,
             codes: cur_code,
+            code_langs: cur_code_langs,
             source: None,
         });
     }
+}
 
-    // Extract rustdoc item tables (Modules, Structs, Traits, Macros, Functions, etc.)
-    // so agents can discover submodules (e.g. `module: "sync"`) directly from crate root docs.
+fn extract_rustdoc_methods(doc: &scraper::Html, sections: &mut Vec<DocSection>) {
+    let (Ok(method_sel), Ok(header_sel), Ok(docblock_sel), Ok(p_sel), Ok(pre_sel)) = (
+        scraper::Selector::parse("section.method, details.toggle.method-toggle"),
+        scraper::Selector::parse("h4.code-header, h3.code-header"),
+        scraper::Selector::parse("div.docblock"),
+        scraper::Selector::parse("p"),
+        scraper::Selector::parse("pre"),
+    ) else {
+        return;
+    };
+
+    for method in doc.select(&method_sel) {
+        let Some(header_el) = method.select(&header_sel).next() else {
+            continue;
+        };
+        let sig = clean_code_signature(&clean_inline_text(&header_el));
+        if sig.is_empty() {
+            continue;
+        }
+
+        let mut descs = Vec::new();
+        let mut codes = Vec::new();
+        let mut code_langs = Vec::new();
+        if let Some(docblock) = method.select(&docblock_sel).next() {
+            for p in docblock.select(&p_sel) {
+                let txt = clean_inline_text(&p);
+                if !txt.is_empty() && !descs.contains(&txt) {
+                    descs.push(txt);
+                }
+            }
+            for pre in docblock.select(&pre_sel) {
+                let code = extract_clean_code_block(&pre);
+                if !code.is_empty() {
+                    codes.push(code);
+                    code_langs.push(Some("rust".to_string()));
+                }
+            }
+        }
+        if descs.is_empty() {
+            descs.push(sig.clone());
+        }
+        sections.push(DocSection {
+            title: sig,
+            descriptions: descs,
+            codes,
+            code_langs,
+            source: None,
+        });
+    }
+}
+
+fn parse_html_doc(html: &str, source_url: &str, ecosystem: Ecosystem, lib_name: &str) -> ParsedDoc {
+    let doc = scraper::Html::parse_document(html);
+
+    let Ok(children_selector) = scraper::Selector::parse("h1, h2, h3, h4, p, li, pre") else {
+        return ParsedDoc {
+            sections: Vec::new(),
+            fallback: clean_html_fallback(&doc),
+            source_url: source_url.to_string(),
+            lang: ecosystem.as_str().to_string(),
+            metadata: Vec::new(),
+        };
+    };
+
+    let mut sections: Vec<DocSection> = Vec::new();
+    let mut matched_container = false;
+
+    // On pkg.go.dev, extract BOTH README and API Documentation sections instead of stopping at README.
+    let go_containers = ["div.UnitReadme-content", "div.Documentation-content"];
+    let mut matched_go = false;
+    for sel_str in go_containers {
+        if let Ok(sel) = scraper::Selector::parse(sel_str) {
+            let containers: Vec<_> = doc.select(&sel).collect();
+            if !containers.is_empty() {
+                matched_go = true;
+                matched_container = true;
+                let default_title = if sel_str == "div.Documentation-content" {
+                    format!("{lib_name} API Documentation")
+                } else {
+                    format!("{lib_name} Overview")
+                };
+                for container in containers {
+                    parse_container_elements(
+                        &container,
+                        &children_selector,
+                        &default_title,
+                        &mut sections,
+                    );
+                }
+            }
+        }
+    }
+
+    if !matched_go {
+        // On docs.rs, prefer the top-level crate/item docblock (not method docblocks extracted below).
+        let primary_selectors = [
+            "section#main-content > details.top-doc > div.docblock",
+            "section#main-content > div.docblock",
+            "div.docblock",
+            "div.project-description",
+            "article",
+            "main",
+        ];
+
+        for sel_str in primary_selectors {
+            let Ok(sel) = scraper::Selector::parse(sel_str) else {
+                continue;
+            };
+            let containers: Vec<_> = doc.select(&sel).collect();
+            if containers.is_empty() {
+                continue;
+            }
+            matched_container = true;
+            let default_title = format!("{lib_name} Overview");
+            for container in containers {
+                parse_container_elements(
+                    &container,
+                    &children_selector,
+                    &default_title,
+                    &mut sections,
+                );
+            }
+            if !sections.is_empty() {
+                break;
+            }
+        }
+    }
+
+    // Extract rustdoc method signatures (struct/trait pages) and item tables (crate/module pages).
+    extract_rustdoc_methods(&doc, &mut sections);
     extract_rustdoc_item_tables(&doc, &mut sections);
     if !sections.is_empty() {
         matched_container = true;
     }
 
     let fallback = if !matched_container || sections.is_empty() {
-        clean_inline_text(&doc.root_element())
+        clean_html_fallback(&doc)
     } else {
         String::new()
     };
@@ -966,8 +1186,146 @@ fn extract_rustdoc_item_tables(doc: &scraper::Html, sections: &mut Vec<DocSectio
                 title: heading,
                 descriptions: items,
                 codes: Vec::new(),
+                code_langs: Vec::new(),
                 source: None,
             });
+        }
+    }
+}
+
+fn is_rst_underline(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.len() < 3 {
+        return false;
+    }
+    let Some(first) = trimmed.chars().next() else {
+        return false;
+    };
+    matches!(first, '=' | '-' | '~' | '^' | '*' | '+' | '#')
+        && trimmed.chars().all(|ch| ch == first)
+}
+
+fn is_rst_directive_noise(trimmed: &str) -> bool {
+    trimmed.starts_with(".. image::")
+        || trimmed.starts_with(".. figure::")
+        || trimmed.starts_with(".. raw::")
+        || trimmed.starts_with(".. toctree::")
+        || trimmed.starts_with(".. rubric::")
+        || trimmed.starts_with(".. contents::")
+        || trimmed.starts_with(":target:")
+        || trimmed.starts_with(":alt:")
+        || trimmed.starts_with(":width:")
+        || trimmed.starts_with(":height:")
+        || trimmed.starts_with(":align:")
+        || trimmed.starts_with(":class:")
+        || trimmed.starts_with(":scale:")
+}
+
+enum RstCodeDirective {
+    None,
+    Start(Option<String>),
+}
+
+fn parse_rst_code_directive(trimmed: &str) -> RstCodeDirective {
+    let Some(rest) = trimmed
+        .strip_prefix(".. code-block::")
+        .or_else(|| trimmed.strip_prefix(".. sourcecode::"))
+        .or_else(|| trimmed.strip_prefix(".. code::"))
+    else {
+        return RstCodeDirective::None;
+    };
+    let lang = rest.split_whitespace().next().unwrap_or("");
+    if lang.is_empty() {
+        RstCodeDirective::Start(None)
+    } else {
+        RstCodeDirective::Start(Some(lang.to_ascii_lowercase()))
+    }
+}
+
+fn extract_fence_lang(trimmed_fence: &str) -> Option<String> {
+    let info = trimmed_fence.trim_start_matches('`').trim();
+    let lang = info
+        .split(|ch: char| ch.is_whitespace() || ch == ',' || ch == '{')
+        .next()
+        .unwrap_or("")
+        .trim();
+    if lang.is_empty() {
+        None
+    } else {
+        Some(lang.to_ascii_lowercase())
+    }
+}
+
+struct MarkdownBuilder {
+    sections: Vec<DocSection>,
+    cur_title: String,
+    cur_desc: Vec<String>,
+    cur_code: Vec<String>,
+    cur_code_langs: Vec<Option<String>>,
+    source: Option<String>,
+    current_h1: Option<String>,
+}
+
+impl MarkdownBuilder {
+    fn new(lib_name: &str, summary: &str, source_label: &str) -> Self {
+        let mut cur_desc = Vec::new();
+        if !summary.trim().is_empty() {
+            cur_desc.push(summary.trim().to_string());
+        }
+        Self {
+            sections: Vec::new(),
+            cur_title: format!("{lib_name} Overview"),
+            cur_desc,
+            cur_code: Vec::new(),
+            cur_code_langs: Vec::new(),
+            source: (!source_label.is_empty()).then(|| source_label.to_string()),
+            current_h1: None,
+        }
+    }
+
+    fn flush(&mut self) {
+        if !self.cur_desc.is_empty() || !self.cur_code.is_empty() {
+            self.sections.push(DocSection {
+                title: self.cur_title.clone(),
+                descriptions: std::mem::take(&mut self.cur_desc),
+                codes: std::mem::take(&mut self.cur_code),
+                code_langs: std::mem::take(&mut self.cur_code_langs),
+                source: self.source.clone(),
+            });
+        }
+    }
+
+    fn push_code(&mut self, buf: &mut Vec<String>, lang: &mut Option<String>) {
+        let block = buf.join("\n").trim().to_string();
+        buf.clear();
+        if block.is_empty() {
+            *lang = None;
+        } else {
+            self.cur_code.push(block);
+            self.cur_code_langs.push(lang.take());
+        }
+    }
+
+    fn set_heading(&mut self, raw: &str, level: usize) {
+        self.flush();
+        let heading = clean_heading_text(raw);
+        if heading.is_empty() {
+            return;
+        }
+        if level == 1 {
+            self.current_h1 = Some(heading.clone());
+            self.cur_title = heading;
+        } else if let Some(h1) = &self.current_h1 {
+            if heading
+                .to_ascii_lowercase()
+                .contains(&h1.to_ascii_lowercase())
+            {
+                self.cur_title = heading;
+            } else {
+                self.cur_title = format!("{h1} > {heading}");
+            }
+        } else {
+            self.cur_title = heading;
         }
     }
 }
@@ -978,94 +1336,116 @@ pub(crate) fn parse_markdown_sections(
     source_label: &str,
     lib_name: &str,
 ) -> Vec<DocSection> {
-    let mut sections: Vec<DocSection> = Vec::new();
-    let mut cur_title = format!("{lib_name} Overview");
-    let mut cur_desc: Vec<String> = Vec::new();
-    if !summary.trim().is_empty() {
-        cur_desc.push(summary.trim().to_string());
-    }
-    let mut cur_code: Vec<String> = Vec::new();
-    let source_opt = (!source_label.is_empty()).then(|| source_label.to_string());
-
+    let mut builder = MarkdownBuilder::new(lib_name, summary, source_label);
     let mut in_code_block = false;
+    let mut current_fence_lang: Option<String> = None;
+    let mut in_rst_code = false;
+    let mut rst_code_lang: Option<String> = None;
     let mut code_buf: Vec<String> = Vec::new();
-    let mut current_h1: Option<String> = None;
 
-    for line in md.lines() {
+    let lines: Vec<&str> = md.lines().collect();
+    let mut idx = 0_usize;
+
+    while idx < lines.len() {
+        let line = lines[idx];
         let trimmed = line.trim();
+
         if trimmed.starts_with("```") {
             if in_code_block {
-                let block = code_buf.join("\n").trim().to_string();
-                if !block.is_empty() {
-                    cur_code.push(block);
-                }
-                code_buf.clear();
+                builder.push_code(&mut code_buf, &mut current_fence_lang);
                 in_code_block = false;
             } else {
                 in_code_block = true;
+                current_fence_lang = extract_fence_lang(trimmed);
             }
+            idx += 1;
             continue;
         }
 
         if in_code_block {
             code_buf.push(line.to_string());
+            idx += 1;
+            continue;
+        }
+
+        if in_rst_code {
+            if trimmed.is_empty() {
+                if !code_buf.is_empty() {
+                    code_buf.push(String::new());
+                }
+                idx += 1;
+                continue;
+            }
+            if line.starts_with(' ') || line.starts_with('\t') {
+                if !trimmed.starts_with(':') {
+                    code_buf.push(line.to_string());
+                }
+                idx += 1;
+                continue;
+            }
+            builder.push_code(&mut code_buf, &mut rst_code_lang);
+            in_rst_code = false;
+        }
+
+        if let RstCodeDirective::Start(lang_opt) = parse_rst_code_directive(trimmed) {
+            in_rst_code = true;
+            rst_code_lang = lang_opt;
+            code_buf.clear();
+            idx += 1;
             continue;
         }
 
         if trimmed.starts_with('#') {
-            if !cur_desc.is_empty() || !cur_code.is_empty() {
-                sections.push(DocSection {
-                    title: cur_title.clone(),
-                    descriptions: std::mem::take(&mut cur_desc),
-                    codes: std::mem::take(&mut cur_code),
-                    source: source_opt.clone(),
-                });
-            }
             let level = trimmed.bytes().take_while(|&b| b == b'#').count();
-            let heading = trimmed.trim_start_matches('#').trim().to_string();
-            if !heading.is_empty() {
-                if level == 1 {
-                    current_h1 = Some(heading.clone());
-                    cur_title = heading;
-                } else if let Some(h1) = &current_h1 {
-                    if heading
-                        .to_ascii_lowercase()
-                        .contains(&h1.to_ascii_lowercase())
-                    {
-                        cur_title = heading;
-                    } else {
-                        cur_title = format!("{h1} > {heading}");
-                    }
-                } else {
-                    cur_title = heading;
+            builder.set_heading(trimmed.trim_start_matches('#'), level);
+            idx += 1;
+            continue;
+        }
+
+        if !trimmed.is_empty()
+            && !is_rst_underline(trimmed)
+            && !trimmed.starts_with("..")
+            && idx + 1 < lines.len()
+            && is_rst_underline(lines[idx + 1])
+        {
+            let underline_ch = lines[idx + 1].trim().chars().next().unwrap_or('-');
+            let level = if underline_ch == '=' { 1 } else { 2 };
+            // Avoid H1>H2 prefix when RST uses `---` for top-level subsections without H1 repetition.
+            if level == 1 {
+                builder.set_heading(trimmed, 1);
+            } else {
+                builder.flush();
+                let heading = clean_heading_text(trimmed);
+                if !heading.is_empty() {
+                    builder.cur_title = heading;
                 }
             }
-        } else if !trimmed.is_empty() {
-            if trimmed.starts_with("[![")
-                || trimmed.starts_with("<img")
-                || trimmed.starts_with("<br")
-                || (trimmed.starts_with('<') && trimmed.ends_with('>'))
-            {
-                continue;
-            }
+            idx += 2;
+            continue;
+        }
+
+        if !trimmed.is_empty()
+            && !is_rst_underline(trimmed)
+            && !is_rst_directive_noise(trimmed)
+            && !trimmed.starts_with("[![")
+            && !trimmed.starts_with("<img")
+            && !trimmed.starts_with("<br")
+            && !(trimmed.starts_with('<') && trimmed.ends_with('>'))
+        {
             let cleaned = strip_html_tags(trimmed);
             let cleaned = cleaned.trim();
             if !cleaned.is_empty() {
-                cur_desc.push(cleaned.to_string());
+                builder.cur_desc.push(cleaned.to_string());
             }
         }
+        idx += 1;
     }
 
-    if !cur_desc.is_empty() || !cur_code.is_empty() {
-        sections.push(DocSection {
-            title: cur_title,
-            descriptions: cur_desc,
-            codes: cur_code,
-            source: source_opt,
-        });
+    if in_rst_code {
+        builder.push_code(&mut code_buf, &mut rst_code_lang);
     }
-
-    sections
+    builder.flush();
+    builder.sections
 }
 
 fn parse_markdown_doc(
@@ -1233,8 +1613,48 @@ fn score_line(line: &str, tokens: &[String]) -> usize {
     score + distinct * distinct * 8
 }
 
+fn is_changelog_title_or_source(section: &DocSection) -> bool {
+    if let Some(src) = &section.source {
+        let lower_src = src.to_ascii_lowercase();
+        if lower_src.contains("changelog")
+            || lower_src.contains("migration")
+            || lower_src.contains("history.md")
+            || lower_src.contains("changes.md")
+        {
+            return true;
+        }
+    }
+
+    let lower_title = section.title.to_ascii_lowercase();
+    if lower_title.contains("changelog")
+        || lower_title.contains("release notes")
+        || lower_title.contains("migration")
+        || matches!(
+            lower_title.as_str(),
+            "fixed" | "fixes" | "changed" | "added" | "removed" | "deprecated" | "bug fixes"
+        )
+    {
+        return true;
+    }
+
+    // Headings that start with a semver release number (e.g. `0.13.0`, `v1.2.3`, `Version 2.0`)
+    let stripped = lower_title
+        .trim_start_matches("version ")
+        .trim_start_matches(['v', '[', '(']);
+    let mut segs = stripped.split('.');
+    matches!(
+        (segs.next(), segs.next()),
+        (Some(a), Some(b))
+            if !a.is_empty()
+                && a.chars().all(|c| c.is_ascii_digit())
+                && !b.is_empty()
+                && b.chars().next().is_some_and(|c| c.is_ascii_digit())
+    )
+}
+
 fn score_section(section: &DocSection, tokens: &[String]) -> usize {
     let title_words = tokenize_words(&section.title);
+    let source_words = section.source.as_deref().map_or_default(tokenize_words);
     let desc_words = tokenize_words(&section.descriptions.join(" "));
     let code_words = tokenize_words(&section.codes.join("\n"));
 
@@ -1243,11 +1663,14 @@ fn score_section(section: &DocSection, tokens: &[String]) -> usize {
 
     for token in tokens {
         let (t_exact, t_prefix) = count_word_hits(&title_words, token);
+        let (s_exact, s_prefix) = count_word_hits(&source_words, token);
         let (c_exact, c_prefix) = count_word_hits(&code_words, token);
         let (d_exact, d_prefix) = count_word_hits(&desc_words, token);
 
         let token_score = t_exact.min(2) * 25
             + t_prefix.min(2) * 10
+            + s_exact.min(2) * 20
+            + s_prefix.min(2) * 8
             + c_exact.min(3) * 8
             + c_prefix.min(2) * 3
             + d_exact.min(4) * 5
@@ -1264,6 +1687,10 @@ fn score_section(section: &DocSection, tokens: &[String]) -> usize {
         score += distinct_matched * distinct_matched * 15;
         if !section.codes.is_empty() {
             score += 4;
+        }
+        // Demote changelog/migration entries so real documentation ranks ahead of release history.
+        if is_changelog_title_or_source(section) {
+            score = (score / 4).max(1);
         }
     }
     score
@@ -1330,6 +1757,73 @@ pub fn slice_with_pagination(input: &str, offset: usize, max_chars: usize) -> St
     }
 }
 
+fn format_single_section(
+    section: &DocSection,
+    default_source: &str,
+    lang: &str,
+    tokens: &[String],
+) -> String {
+    let mut block = String::new();
+    let _ = writeln!(block, "TITLE: {}", section.title);
+    if !section.descriptions.is_empty() {
+        let selected_lines: Vec<&str> = if !tokens.is_empty() && section.descriptions.len() > 4 {
+            let mut scored_lines: Vec<(usize, usize, &str)> = section
+                .descriptions
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, line)| {
+                    let s = score_line(line, tokens);
+                    (s > 0).then_some((s, idx, line.as_str()))
+                })
+                .collect();
+            if scored_lines.is_empty() {
+                section.descriptions.iter().map(String::as_str).collect()
+            } else {
+                scored_lines.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+                scored_lines.into_iter().map(|(_, _, line)| line).collect()
+            }
+        } else {
+            section.descriptions.iter().map(String::as_str).collect()
+        };
+        let _ = writeln!(block, "DESCRIPTION:\n{}", selected_lines.join("\n"));
+    }
+
+    let src = section.source.as_deref().unwrap_or(default_source);
+    let _ = writeln!(block, "SOURCE: {src}");
+    let _ = writeln!(block, "LANGUAGE: {lang}");
+
+    if !section.codes.is_empty() {
+        let mut indexed: Vec<(usize, usize, &str, &str)> = section
+            .codes
+            .iter()
+            .enumerate()
+            .map(|(idx, code)| {
+                let fence = section
+                    .code_langs
+                    .get(idx)
+                    .and_then(Option::as_deref)
+                    .unwrap_or(lang);
+                let s = if tokens.is_empty() {
+                    0
+                } else {
+                    score_line(code, tokens)
+                };
+                (s, idx, code.as_str(), fence)
+            })
+            .collect();
+        if !tokens.is_empty() && indexed.len() > 2 {
+            indexed.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        }
+
+        block.push_str("CODE:\n");
+        for (_, _, code, fence_lang) in indexed.into_iter().take(3) {
+            let _ = writeln!(block, "```{fence_lang}\n{code}\n```");
+        }
+    }
+    block.push_str("----------------------------------------\n\n");
+    block
+}
+
 fn format_sections_all(
     sections: &[DocSection],
     default_source: &str,
@@ -1373,64 +1867,7 @@ fn format_sections_all(
     };
 
     for section in ordered {
-        let mut block = String::new();
-        let _ = writeln!(block, "TITLE: {}", section.title);
-        if !section.descriptions.is_empty() {
-            // When filtering by topic on a long section (e.g. llms.txt link lists or module
-            // tables), surface matching lines first instead of keeping only the first 4 lines.
-            let selected_lines: Vec<&str> = if !tokens.is_empty() && section.descriptions.len() > 4
-            {
-                let mut scored_lines: Vec<(usize, usize, &str)> = section
-                    .descriptions
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(idx, line)| {
-                        let s = score_line(line, &tokens);
-                        (s > 0).then_some((s, idx, line.as_str()))
-                    })
-                    .collect();
-                if scored_lines.is_empty() {
-                    section.descriptions.iter().map(String::as_str).collect()
-                } else {
-                    scored_lines.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-                    scored_lines.into_iter().map(|(_, _, line)| line).collect()
-                }
-            } else {
-                section.descriptions.iter().map(String::as_str).collect()
-            };
-
-            let desc_joined = selected_lines.join("\n");
-            let _ = writeln!(block, "DESCRIPTION:\n{desc_joined}");
-        }
-        let src = section.source.as_deref().unwrap_or(default_source);
-        let _ = writeln!(block, "SOURCE: {src}");
-        let _ = writeln!(block, "LANGUAGE: {lang}");
-
-        if !section.codes.is_empty() {
-            let selected_codes: Vec<&str> = if !tokens.is_empty() && section.codes.len() > 2 {
-                let mut scored_codes: Vec<(usize, usize, &str)> = section
-                    .codes
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, code)| (score_line(code, &tokens), idx, code.as_str()))
-                    .collect();
-                scored_codes.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-                scored_codes
-                    .into_iter()
-                    .take(3)
-                    .map(|(_, _, code)| code)
-                    .collect()
-            } else {
-                section.codes.iter().take(3).map(String::as_str).collect()
-            };
-
-            block.push_str("CODE:\n");
-            for code in selected_codes {
-                let _ = writeln!(block, "```{lang}\n{code}\n```");
-            }
-        }
-        block.push_str("----------------------------------------\n\n");
-
+        let block = format_single_section(section, default_source, lang, &tokens);
         if out.len() + block.len() > max_total && !out.is_empty() {
             break;
         }
@@ -1452,18 +1889,7 @@ pub(crate) fn render_doc_sections_paginated(
     slice_with_pagination(&full, offset, max_chars)
 }
 
-fn render_context7_sections(
-    sections: &[DocSection],
-    source_url: &str,
-    lang: &str,
-    topic: Option<&str>,
-    max_chars: usize,
-) -> String {
-    let rendered = format_sections_all(sections, source_url, lang, topic, max_chars);
-    truncate_smart(&rendered, max_chars)
-}
-
-/// Remove inline HTML tag markup from a text line.
+/// Remove inline HTML tag markup from a text line (preserving standalone `>` such as `->`).
 #[must_use]
 pub fn strip_html_tags(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
@@ -1471,7 +1897,7 @@ pub fn strip_html_tags(input: &str) -> String {
     for ch in input.chars() {
         match ch {
             '<' => in_tag = true,
-            '>' => in_tag = false,
+            '>' if in_tag => in_tag = false,
             other if !in_tag => out.push(other),
             _ => {}
         }
@@ -1788,15 +2214,28 @@ impl FastDocsServer {
             .map(str::trim)
             .filter(|d| !d.is_empty() && !d.contains('\0'));
 
-        let ecosystem = req
-            .lang
-            .as_deref()
-            .and_then(Ecosystem::parse)
+        let explicit_ecosystem = match parse_ecosystem_arg(req.lang.as_deref()) {
+            Ok(opt) => opt,
+            Err(err) => {
+                return Ok(CallToolResult::success(vec![ContentBlock::text(err)]));
+            }
+        };
+
+        let ecosystem = explicit_ecosystem
             .or_else(|| {
                 project_dir_clean
                     .and_then(|dir| detect_project_ecosystem(Path::new(dir), &req.library))
             })
             .unwrap_or_else(|| detect_lang(&req.library));
+
+        // For Go short names (e.g. `pflag`), resolve full module path from `go.mod` when unique.
+        let effective_library = if ecosystem == Ecosystem::Go && !req.library.contains('/') {
+            project_dir_clean
+                .and_then(|dir| resolve_go_short_name(Path::new(dir), &req.library))
+                .unwrap_or_else(|| req.library.clone())
+        } else {
+            req.library.clone()
+        };
 
         let mut resolved_source: Option<&'static str> = None;
         let version = match req
@@ -1809,7 +2248,7 @@ impl FastDocsServer {
             None => {
                 if let Some(dir) = project_dir_clean {
                     if let Some(resolved) =
-                        resolve_project_version(Path::new(dir), &req.library, ecosystem)
+                        resolve_project_version(Path::new(dir), &effective_library, ecosystem)
                     {
                         resolved_source = Some(resolved.source_file);
                         resolved.version
@@ -1825,16 +2264,20 @@ impl FastDocsServer {
         let max_chars = clamp_max_chars(req.max_chars);
         let offset = req.offset.unwrap_or(0);
 
-        let url =
-            match build_url_with_module(&req.library, &version, ecosystem, req.module.as_deref()) {
-                Ok(url) => url,
-                Err(err) => {
-                    return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                        "Invalid request for '{}': {err}",
-                        req.library
-                    ))]));
-                }
-            };
+        let url = match build_url_with_module(
+            &effective_library,
+            &version,
+            ecosystem,
+            req.module.as_deref(),
+        ) {
+            Ok(url) => url,
+            Err(err) => {
+                return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                    "Invalid request for '{}': {err}",
+                    req.library
+                ))]));
+            }
+        };
 
         // PyPI and npm package READMEs are single-document sources; fold any `module` hint into `topic`.
         let effective_topic: Option<String> =
@@ -2002,7 +2445,12 @@ impl FastDocsServer {
             )]));
         }
 
-        let scope = SearchScope::from_opt(req.lang.as_deref());
+        let scope = match SearchScope::parse_arg(req.lang.as_deref()) {
+            Ok(scope) => scope,
+            Err(err) => {
+                return Ok(CallToolResult::success(vec![ContentBlock::text(err)]));
+            }
+        };
         let search_cache_key =
             format!("search:{}:{}", scope.as_key(), trimmed.to_ascii_lowercase());
 

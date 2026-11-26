@@ -3,9 +3,9 @@ use std::fmt::Write as _;
 use fast_docs::tools::{
     clamp_max_chars, detect_lang, extract_pypi_candidate, html_to_context7,
     html_to_context7_with_options, markdown_to_context7, markdown_to_context7_with_options,
-    parse_pypi_json_to_context7, resolve_go_module, slice_with_pagination, strip_html_tags,
-    truncate_smart, urlencoding, Ecosystem, MAX_ALLOWED_OUTPUT_CHARS, MAX_OUTPUT_CHARS,
-    MIN_OUTPUT_CHARS,
+    parse_ecosystem_arg, parse_pypi_json_to_context7, resolve_go_module, slice_with_pagination,
+    strip_html_tags, truncate_smart, urlencoding, Ecosystem, MAX_ALLOWED_OUTPUT_CHARS,
+    MAX_OUTPUT_CHARS, MIN_OUTPUT_CHARS,
 };
 use proptest::prelude::*;
 
@@ -391,6 +391,225 @@ fn extract_pypi_candidate_handles_single_and_multi_word_queries() {
     );
     assert_eq!(extract_pypi_candidate("../evil fixtures"), None);
     assert_eq!(extract_pypi_candidate("   "), None);
+}
+
+#[test]
+fn parse_ecosystem_arg_rejects_typos_and_unknown_languages() {
+    assert_eq!(parse_ecosystem_arg(None), Ok(None));
+    assert_eq!(parse_ecosystem_arg(Some("  ")), Ok(None));
+    assert_eq!(parse_ecosystem_arg(Some("rust")), Ok(Some(Ecosystem::Rust)));
+    assert_eq!(parse_ecosystem_arg(Some("ts")), Ok(Some(Ecosystem::Npm)));
+    for bad in ["pyhton", "rsut", "golang2", "ts2", "cobol"] {
+        assert!(
+            parse_ecosystem_arg(Some(bad)).is_err(),
+            "must reject invalid lang {bad:?}"
+        );
+    }
+}
+
+#[test]
+fn detect_lang_recognizes_go_vanity_imports_and_stdlib() {
+    for go_pkg in [
+        "go.yaml.in/yaml/v3",
+        "gopkg.in/yaml.v3",
+        "k8s.io/client-go",
+        "sigs.k8s.io/yaml",
+        "net/http",
+        "encoding/json",
+        "fmt",
+    ] {
+        assert_eq!(
+            detect_lang(go_pkg),
+            Ecosystem::Go,
+            "expected Go for {go_pkg:?}"
+        );
+    }
+}
+
+#[test]
+fn html_to_context7_extracts_both_readme_and_api_docs_on_pkg_go_dev() {
+    let html = r##"
+    <html><body>
+      <div class="UnitReadme-content">
+        <h1>pflag</h1>
+        <p>Drop-in replacement for Go standard flag package supporting POSIX flags.</p>
+      </div>
+      <div class="Documentation-content">
+        <h3>func Parse <a href="#Parse">¶</a></h3>
+        <p>Parse parses the command-line flags from os.Args[1:].</p>
+        <pre>func Parse()</pre>
+      </div>
+    </body></html>
+    "##;
+
+    let rendered = html_to_context7_with_options(
+        html,
+        "https://pkg.go.dev/github.com/spf13/pflag",
+        Ecosystem::Go,
+        "pflag",
+        Some("Parse"),
+        Some(6500),
+    );
+    assert!(
+        rendered.contains("func Parse"),
+        "pkg.go.dev Documentation-content must be extracted alongside README: {rendered}"
+    );
+    assert!(
+        !rendered.contains('¶'),
+        "pilcrow anchor symbol must be stripped from Go headings: {rendered}"
+    );
+}
+
+#[test]
+fn html_to_context7_extracts_rustdoc_methods_and_preserves_clean_code() {
+    let html = r#"
+    <html><body><main><section id="main-content">
+      <div class="docblock">
+        <p>WalkBuilder configures recursive directory traversal with gitignore support.</p>
+      </div>
+      <section class="method">
+        <h4 class="code-header">pub fn hidden(&amp;mut self, yes: bool) -&gt; &amp;mut Self</h4>
+        <div class="docblock">
+          <p>Enables ignoring hidden files and directories during traversal.</p>
+        </div>
+      </section>
+    </section></main></body></html>
+    "#;
+
+    let rendered = html_to_context7_with_options(
+        html,
+        "https://docs.rs/ignore/0.4.34/ignore/struct.WalkBuilder.html",
+        Ecosystem::Rust,
+        "ignore",
+        Some("hidden"),
+        Some(6500),
+    );
+    assert!(
+        rendered.contains("pub fn hidden(&mut self, yes: bool) -> &mut Self"),
+        "rustdoc method signature must be extracted: {rendered}"
+    );
+}
+
+#[test]
+fn rst_parser_extracts_underlined_headings_code_blocks_and_strips_directives() {
+    let rst = "\
+.. image:: https://example.com/badge.svg
+   :target: https://example.com
+   :alt: Build Status
+
+AnyIO Overview
+==============
+
+Asynchronous networking and concurrency library for Python.
+
+Task Groups
+-----------
+
+Run structured concurrent tasks safely.
+
+.. code-block:: python
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(worker)
+";
+
+    let rendered = markdown_to_context7_with_options(
+        rst,
+        "",
+        "https://pypi.org/project/anyio/",
+        Ecosystem::Python,
+        "anyio",
+        Some("task groups"),
+        Some(6500),
+    );
+    assert!(
+        rendered.contains("TITLE: Task Groups"),
+        "RST underlined heading must be extracted: {rendered}"
+    );
+    assert!(
+        rendered.contains("create_task_group"),
+        "RST code-block must be extracted: {rendered}"
+    );
+    assert!(
+        !rendered.contains(".. image::") && !rendered.contains(":target:"),
+        "RST image directives must be stripped: {rendered}"
+    );
+}
+
+#[test]
+fn topic_ranking_penalizes_changelog_sections_below_real_docs() {
+    let md = "\
+# 0.13.0
+Fixed connection pool timeout bug in connection pool manager for connection pool retries.
+# Changelog
+Connection pool timeout improvements in release 0.12.0.
+# Connection Pool
+Configure connection pool limits and keep-alive timeouts for outgoing HTTP clients.
+```python
+pool = httpcore.ConnectionPool(max_connections=10)
+```
+";
+
+    let rendered = markdown_to_context7_with_options(
+        md,
+        "",
+        "https://pypi.org/project/httpcore/",
+        Ecosystem::Python,
+        "httpcore",
+        Some("connection pool"),
+        Some(6500),
+    );
+    let real_pos = rendered.find("TITLE: Connection Pool");
+    let changelog_pos = rendered.find("TITLE: 0.13.0");
+    assert!(real_pos.is_some(), "real doc section missing: {rendered}");
+    if let Some(cl_pos) = changelog_pos {
+        assert!(
+            real_pos < Some(cl_pos),
+            "real documentation must rank above changelog entries: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn code_blocks_preserve_original_fence_language() {
+    let md = "# Example\nRun the Go server.\n```go\nfunc main() {}\n```\n";
+    let rendered = markdown_to_context7_with_options(
+        md,
+        "",
+        "https://hono.dev/llms.txt",
+        Ecosystem::Npm,
+        "demo",
+        None,
+        Some(2000),
+    );
+    assert!(
+        rendered.contains("```go\nfunc main() {}\n```"),
+        "original ```go fence language must be preserved: {rendered}"
+    );
+}
+
+#[test]
+fn pagination_footer_appears_at_offset_zero_when_output_is_truncated() {
+    let mut md = String::from("# Guide\n");
+    for i in 1..=30 {
+        let _ = writeln!(
+            md,
+            "## Section {i}\nDetailed explanation paragraph for section {i} covering configuration and options."
+        );
+    }
+    let rendered = markdown_to_context7_with_options(
+        &md,
+        "",
+        "https://docs.rs/demo/latest",
+        Ecosystem::Rust,
+        "demo",
+        None,
+        Some(600),
+    );
+    assert!(
+        rendered.contains("pass offset="),
+        "truncated output at offset=0 must include pagination footer: {rendered}"
+    );
 }
 
 proptest! {
