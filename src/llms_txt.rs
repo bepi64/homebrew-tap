@@ -4,6 +4,8 @@ use std::time::Duration;
 use reqwest::redirect::Policy;
 use reqwest::Url;
 
+use crate::tools::FetchOutcome;
+
 const MAX_TARGET_LEN: usize = 300;
 const MAX_REDIRECTS: usize = 5;
 
@@ -196,8 +198,44 @@ pub async fn resolve_public_socket_addrs(host: &str) -> Result<Vec<SocketAddr>, 
     Ok(addrs)
 }
 
+/// Validate a `Location` redirect header against SSRF rules before following it.
+///
+/// Permits relative paths and cross-host HTTPS redirects to public hostnames (for example
+/// `docs.pydantic.dev/llms.txt` → `pydantic.dev/docs/validation/latest/llms.txt`), while strictly
+/// rejecting non-HTTPS schemes, explicit ports, credentials, IP literals, and internal suffixes.
+///
+/// # Errors
+/// Returns an error if `location` cannot be resolved or violates the public-HTTPS safety policy.
+pub fn validate_llms_redirect_target(current: &Url, location: &str) -> Result<Url, String> {
+    let trimmed = location.trim();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_control) {
+        return Err("blocked redirect: empty or malformed Location header".to_string());
+    }
+    let next = current
+        .join(trimmed)
+        .map_err(|err| format!("blocked redirect: invalid target URL: {err}"))?;
+
+    if next.scheme() != "https" {
+        return Err(format!(
+            "blocked redirect: forbidden scheme '{}'",
+            next.scheme()
+        ));
+    }
+    if next.port().is_some() {
+        return Err("blocked redirect: explicit port is forbidden".to_string());
+    }
+    if !next.username().is_empty() || next.password().is_some() {
+        return Err("blocked redirect: embedded credentials are forbidden".to_string());
+    }
+    let host = next
+        .host_str()
+        .ok_or_else(|| "blocked redirect: missing host".to_string())?;
+    validate_public_hostname(host)?;
+    Ok(next)
+}
+
 /// Build an HTTP client pinned to pre-validated public IP addresses for `host` (preventing DNS
-/// rebinding) and restricting redirects to HTTPS on the same host.
+/// rebinding) with automatic redirects disabled so each redirect hop is re-validated explicitly.
 ///
 /// # Errors
 /// Returns an error if the underlying TLS/HTTP client cannot be constructed.
@@ -207,33 +245,123 @@ pub fn build_pinned_llms_client(
     user_agent: &str,
     connect_timeout: Duration,
 ) -> Result<reqwest::Client, String> {
-    let expected_host = host.to_ascii_lowercase();
-    let redirect_policy = Policy::custom(move |attempt| {
-        if attempt.previous().len() >= MAX_REDIRECTS {
-            return attempt.error("too many redirects");
-        }
-        let target = attempt.url();
-        if target.scheme() != "https"
-            || target.port().is_some()
-            || !target.username().is_empty()
-            || target.password().is_some()
-        {
-            return attempt.error("blocked redirect: unsafe scheme, port, or credentials");
-        }
-        let Some(redirect_host) = target.host_str() else {
-            return attempt.error("blocked redirect: missing host");
-        };
-        if !redirect_host.eq_ignore_ascii_case(&expected_host) {
-            return attempt.error("blocked redirect: cross-host redirect forbidden for llms.txt");
-        }
-        attempt.follow()
-    });
-
     reqwest::Client::builder()
         .user_agent(user_agent)
         .connect_timeout(connect_timeout)
-        .redirect(redirect_policy)
+        .redirect(Policy::none())
         .resolve_to_addrs(host, addrs)
         .build()
         .map_err(|err| format!("failed to build HTTP client: {err}"))
+}
+
+/// Fetch a `llms.txt` / `llms-full.txt` URL following up to 5 HTTPS redirects while re-resolving
+/// DNS, verifying every resolved IP is publicly routable, and pinning the connection on every hop.
+///
+/// # Errors
+/// Returns an error on SSRF/non-public IP detection, redirect limit overflow, network failure,
+/// timeout, non-2xx HTTP status, response size overflow, or invalid UTF-8.
+pub async fn fetch_llms_with_safe_redirects(
+    start_url: &Url,
+    if_none_match: Option<&str>,
+    user_agent: &str,
+    connect_timeout: Duration,
+    request_timeout: Duration,
+    max_bytes: usize,
+) -> Result<FetchOutcome, String> {
+    let mut current = start_url.clone();
+
+    for hop in 0..=MAX_REDIRECTS {
+        let host = current
+            .host_str()
+            .ok_or_else(|| "URL is missing a host".to_string())?
+            .to_string();
+        let addrs = resolve_public_socket_addrs(&host).await?;
+        let client = build_pinned_llms_client(&host, &addrs, user_agent, connect_timeout)?;
+
+        let url_str = current.as_str().to_string();
+        let send_etag = if hop == 0 { if_none_match } else { None };
+
+        let hop_result = tokio::time::timeout(request_timeout, async {
+            let mut req = client.get(&url_str);
+            if let Some(etag) = send_etag {
+                req = req.header(reqwest::header::IF_NONE_MATCH, etag);
+            }
+            let mut resp = req
+                .send()
+                .await
+                .map_err(|err| format!("request failed: {err}"))?;
+
+            let status = resp.status();
+            if status.is_redirection() {
+                let loc = resp
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .ok_or_else(|| format!("HTTP {} missing Location header", status.as_u16()))?;
+                return Ok(HopAction::Redirect(loc.to_string()));
+            }
+
+            let etag = resp
+                .headers()
+                .get(reqwest::header::ETAG)
+                .and_then(|v| v.to_str().ok())
+                .map(ToOwned::to_owned);
+
+            if status == reqwest::StatusCode::NOT_MODIFIED {
+                return Ok(HopAction::Done(FetchOutcome::NotModified { etag }));
+            }
+            if !status.is_success() {
+                return Err(format!("HTTP {}", status.as_u16()));
+            }
+
+            if let Some(content_len) = resp.content_length() {
+                if usize::try_from(content_len).map_or(true, |len| len > max_bytes) {
+                    return Err(format!(
+                        "response exceeds maximum allowed size of {max_bytes} bytes"
+                    ));
+                }
+            }
+
+            let mut buf: Vec<u8> = Vec::new();
+            while let Some(chunk) = resp
+                .chunk()
+                .await
+                .map_err(|err| format!("response stream error: {err}"))?
+            {
+                if buf.len().saturating_add(chunk.len()) > max_bytes {
+                    return Err(format!(
+                        "response exceeds maximum allowed size of {max_bytes} bytes"
+                    ));
+                }
+                buf.extend_from_slice(&chunk);
+            }
+
+            let body = String::from_utf8(buf)
+                .map_err(|err| format!("response is not valid UTF-8: {err}"))?;
+            Ok(HopAction::Done(FetchOutcome::Fetched {
+                body,
+                etag,
+                final_url: url_str,
+            }))
+        })
+        .await
+        .map_err(|_| "request timeout".to_string())??;
+
+        match hop_result {
+            HopAction::Done(outcome) => return Ok(outcome),
+            HopAction::Redirect(location) => {
+                if hop == MAX_REDIRECTS {
+                    return Err("too many redirects".to_string());
+                }
+                current = validate_llms_redirect_target(&current, &location)?;
+            }
+        }
+    }
+
+    Err("too many redirects".to_string())
+}
+
+enum HopAction {
+    Done(FetchOutcome),
+    Redirect(String),
 }

@@ -106,6 +106,11 @@ Architecture Decision Records (ADRs) and open questions for `fast-docs` (`homebr
 - **Decision:** Prioritize `uv.lock` before `pyproject.toml` (PEP 503 matching) and `package-lock.json` (v1/v2/v3) before `package.json` in `src/manifest.rs` (capped at 5 MiB); store PyPI `version` and `project_urls` in a persistent `ParsedDoc.metadata` header rendered even when `topic` filters sections; and return a compact `Available sections:` table of contents instead of dumping unrelated overview prose when a `topic` matches zero sections.
 - **Rationale:** Ensures exact locked versions across Rust, Python, and npm projects; keeps official external documentation links (e.g. ReadTheDocs) visible to MCP clients during topic-filtered Python lookups so they can follow up with `fetch_llms_txt`; and eliminates context noise when a lexical `topic` misses.
 
+### D-18: Per-Hop DNS-Pinned `llms.txt` Redirects, Project-Aware Ecosystem Detection, and H1>H2 Breadcrumbs
+- **Status:** Accepted (2026-11-26)
+- **Decision:** Handle `llms.txt` redirects hop by hop (`fetch_llms_with_safe_redirects`) re-validating HTTPS, public hostname, DNS resolution, and public-IP pinning on each hop; infer ecosystem from `project_dir` manifests (`detect_project_ecosystem`) before falling back to `detect_lang`; preserve `H1 > H2` heading breadcrumbs in `parse_markdown_sections`; and append a `Modules` hint on 404 submodule lookups.
+- **Rationale:** Fixes legitimate cross-host redirects like `docs.pydantic.dev/llms.txt` → `pydantic.dev/docs/validation/latest/llms.txt` without weakening SSRF or DNS-rebinding defenses, prevents homonym collisions (e.g., Python `ruff` vs Rust crate `ruff`) when `project_dir` is provided, and ensures `llms-full.txt` subsections like `# CORS Middleware` / `## Usage` retain parent topic context.
+
 ## Open Questions
 
 - **Q-01 (v1.0.0 release publication):** `Cargo.toml` and `USER_AGENT` are now at `1.0.0`. Once pushed to GitHub (`https://github.com/bepi64/homebrew-tap`) and tagged `v1.0.0`, replace the placeholder `sha256` in `Formula/fast-docs.rb` with the real release archive checksum, then run `brew audit --strict --new Formula/fast-docs.rb`, `brew install --build-from-source Formula/fast-docs.rb`, and `brew test fast-docs`.

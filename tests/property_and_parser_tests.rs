@@ -343,6 +343,43 @@ fn pypi_json_includes_official_documentation_project_urls_even_with_topic() {
     }
 }
 
+#[test]
+fn markdown_preserves_h1_breadcrumb_for_h2_subsections() {
+    let md = "\
+# CORS Middleware
+Configure Cross-Origin Resource Sharing headers on Hono routes.
+## Usage
+Apply the middleware to specific route paths.
+```ts
+app.use('/api/*', cors())
+```
+# Logger Middleware
+Log incoming HTTP requests to stdout.
+## Usage
+Enable request logging globally.
+```ts
+app.use('*', logger())
+```
+";
+
+    let rendered = markdown_to_context7_with_options(
+        md,
+        "",
+        "https://hono.dev/llms-full.txt",
+        Ecosystem::Npm,
+        "hono",
+        Some("cors"),
+        Some(3000),
+    );
+
+    assert!(
+        rendered.contains("TITLE: CORS Middleware > Usage"),
+        "H2 subsection should inherit H1 parent breadcrumb: {rendered}"
+    );
+    assert!(rendered.contains("app.use('/api/*', cors())"));
+    assert!(!rendered.contains("Logger Middleware"));
+}
+
 proptest! {
     #[test]
     fn urlencoding_emits_only_safe_ascii_and_preserves_unreserved(s in ".*") {

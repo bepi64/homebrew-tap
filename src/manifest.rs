@@ -354,6 +354,50 @@ fn resolve_from_uv_lock(content: &str, library: &str) -> Option<String> {
     None
 }
 
+/// Infer the documentation ecosystem for `library` from the manifests present in `project_dir`.
+///
+/// First checks whether `library` is explicitly declared/locked in one of the project's manifests
+/// (resolving name collisions such as `ruff` in a Python repo vs the Rust crate `ruff`). If not
+/// listed yet, falls back to the repository's sole ecosystem when only one language manifest exists.
+#[must_use]
+pub fn detect_project_ecosystem(project_dir: &Path, library: &str) -> Option<Ecosystem> {
+    if !project_dir.is_dir() {
+        return None;
+    }
+
+    for eco in [
+        Ecosystem::Python,
+        Ecosystem::Rust,
+        Ecosystem::Npm,
+        Ecosystem::Go,
+    ] {
+        if resolve_project_version(project_dir, library, eco).is_some() {
+            return Some(eco);
+        }
+    }
+
+    let mut present = Vec::new();
+    if project_dir.join("uv.lock").is_file() || project_dir.join("pyproject.toml").is_file() {
+        present.push(Ecosystem::Python);
+    }
+    if project_dir.join("Cargo.lock").is_file() || project_dir.join("Cargo.toml").is_file() {
+        present.push(Ecosystem::Rust);
+    }
+    if project_dir.join("package-lock.json").is_file() || project_dir.join("package.json").is_file()
+    {
+        present.push(Ecosystem::Npm);
+    }
+    if project_dir.join("go.mod").is_file() {
+        present.push(Ecosystem::Go);
+    }
+
+    if present.len() == 1 {
+        present.into_iter().next()
+    } else {
+        None
+    }
+}
+
 /// Resolve the pinned or declared version of `library` from local project manifests inside
 /// `project_dir` (`Cargo.lock`, `Cargo.toml`, `package-lock.json`, `package.json`, `uv.lock`,
 /// `pyproject.toml`, or `go.mod`).

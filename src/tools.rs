@@ -13,9 +13,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::cache::{DiskCache, DEFAULT_CACHE_TTL, PINNED_CACHE_TTL, SEARCH_CACHE_TTL};
-use crate::llms_txt::{build_llms_txt_url, build_pinned_llms_client, resolve_public_socket_addrs};
+use crate::llms_txt::{build_llms_txt_url, fetch_llms_with_safe_redirects};
 use crate::local_docs::search_local_docs;
-use crate::manifest::resolve_project_version;
+use crate::manifest::{detect_project_ecosystem, resolve_project_version};
 
 /// Minimum configurable output budget for `fetch_docs`.
 pub const MIN_OUTPUT_CHARS: usize = 500;
@@ -977,6 +977,7 @@ pub(crate) fn parse_markdown_sections(
 
     let mut in_code_block = false;
     let mut code_buf: Vec<String> = Vec::new();
+    let mut current_h1: Option<String> = None;
 
     for line in md.lines() {
         let trimmed = line.trim();
@@ -1008,9 +1009,24 @@ pub(crate) fn parse_markdown_sections(
                     source: source_opt.clone(),
                 });
             }
+            let level = trimmed.bytes().take_while(|&b| b == b'#').count();
             let heading = trimmed.trim_start_matches('#').trim().to_string();
             if !heading.is_empty() {
-                cur_title = heading;
+                if level == 1 {
+                    current_h1 = Some(heading.clone());
+                    cur_title = heading;
+                } else if let Some(h1) = &current_h1 {
+                    if heading
+                        .to_ascii_lowercase()
+                        .contains(&h1.to_ascii_lowercase())
+                    {
+                        cur_title = heading;
+                    } else {
+                        cur_title = format!("{h1} > {heading}");
+                    }
+                } else {
+                    cur_title = heading;
+                }
             }
         } else if !trimmed.is_empty() {
             if trimmed.starts_with("[![")
@@ -1753,10 +1769,20 @@ impl FastDocsServer {
         params: Parameters<FetchDocsRequest>,
     ) -> Result<CallToolResult, ErrorData> {
         let req = params.0;
+        let project_dir_clean = req
+            .project_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|d| !d.is_empty() && !d.contains('\0'));
+
         let ecosystem = req
             .lang
             .as_deref()
             .and_then(Ecosystem::parse)
+            .or_else(|| {
+                project_dir_clean
+                    .and_then(|dir| detect_project_ecosystem(Path::new(dir), &req.library))
+            })
             .unwrap_or_else(|| detect_lang(&req.library));
 
         let mut resolved_source: Option<&'static str> = None;
@@ -1768,12 +1794,7 @@ impl FastDocsServer {
         {
             Some(explicit) => explicit.to_string(),
             None => {
-                if let Some(dir) = req
-                    .project_dir
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|d| !d.is_empty() && !d.contains('\0'))
-                {
+                if let Some(dir) = project_dir_clean {
                     if let Some(resolved) =
                         resolve_project_version(Path::new(dir), &req.library, ecosystem)
                     {
@@ -1938,10 +1959,17 @@ impl FastDocsServer {
                     )])),
                 }
             }
-            Err(err) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                "Documentation not found for {label} ({}): {err}",
-                ecosystem.as_str()
-            ))])),
+            Err(err) => {
+                let module_hint = if err == "HTTP 404" && req.module.is_some() {
+                    " (Tip: call fetch_docs without 'module' to inspect the library's available Modules/Items table.)"
+                } else {
+                    ""
+                };
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                    "Documentation not found for {label} ({}): {err}{module_hint}",
+                    ecosystem.as_str()
+                ))]))
+            }
         }
     }
 
@@ -2100,29 +2128,11 @@ impl FastDocsServer {
             }
         }
 
-        let addrs = match resolve_public_socket_addrs(&host).await {
-            Ok(addrs) => addrs,
-            Err(err) => {
-                return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                    "Blocked or unreachable llms.txt host '{host}': {err}"
-                ))]));
-            }
-        };
-
-        let pinned_client =
-            match build_pinned_llms_client(&host, &addrs, USER_AGENT, CONNECT_TIMEOUT) {
-                Ok(client) => client,
-                Err(err) => {
-                    return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                        "Failed to initialize HTTP client for '{host}': {err}"
-                    ))]));
-                }
-            };
-
-        let outcome = fetch_url_conditional(
-            &pinned_client,
-            &url_str,
+        let outcome = fetch_llms_with_safe_redirects(
+            &primary_url,
             stale_etag.as_deref(),
+            USER_AGENT,
+            CONNECT_TIMEOUT,
             REQUEST_TIMEOUT,
             MAX_RESPONSE_BYTES,
         )
@@ -2132,10 +2142,11 @@ impl FastDocsServer {
             Err(err) if want_full && err == "HTTP 404" => {
                 if let Ok(fallback_url) = build_llms_txt_url(&req.target, false) {
                     let fb_str = fallback_url.as_str().to_string();
-                    let fb_res = fetch_url_conditional(
-                        &pinned_client,
-                        &fb_str,
+                    let fb_res = fetch_llms_with_safe_redirects(
+                        &fallback_url,
                         None,
+                        USER_AGENT,
+                        CONNECT_TIMEOUT,
                         REQUEST_TIMEOUT,
                         MAX_RESPONSE_BYTES,
                     )

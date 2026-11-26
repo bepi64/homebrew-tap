@@ -2,7 +2,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use fast_docs::manifest::{normalize_version_spec, resolve_project_version};
+use fast_docs::manifest::{
+    detect_project_ecosystem, normalize_version_spec, resolve_project_version,
+};
 use fast_docs::tools::Ecosystem;
 use proptest::prelude::*;
 
@@ -275,6 +277,35 @@ fn returns_none_on_missing_dir_or_malformed_manifests() {
     assert!(fs::create_dir_all(&dir).is_ok());
     assert!(fs::write(dir.join("package.json"), "{not valid json").is_ok());
     assert_eq!(resolve_project_version(&dir, "zod", Ecosystem::Npm), None);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn detect_project_ecosystem_disambiguates_colliding_names_like_ruff() {
+    let dir = unique_project_dir("ruff-py");
+    assert!(fs::create_dir_all(&dir).is_ok());
+
+    let uv_lock = r#"
+version = 1
+
+[[package]]
+name = "ruff"
+version = "0.17.6"
+"#;
+    assert!(fs::write(dir.join("pyproject.toml"), "[project]\nname = \"app\"\n").is_ok());
+    assert!(fs::write(dir.join("uv.lock"), uv_lock).is_ok());
+
+    // Exact match in uv.lock resolves ruff as Python instead of Rust crate
+    assert_eq!(
+        detect_project_ecosystem(&dir, "ruff"),
+        Some(Ecosystem::Python)
+    );
+    // Unknown library in a pure-Python repo defaults to Python
+    assert_eq!(
+        detect_project_ecosystem(&dir, "some_unlisted_py_lib"),
+        Some(Ecosystem::Python)
+    );
 
     let _ = fs::remove_dir_all(&dir);
 }

@@ -1,6 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use fast_docs::llms_txt::{build_llms_txt_url, is_public_ip};
+use fast_docs::llms_txt::{build_llms_txt_url, is_public_ip, validate_llms_redirect_target};
 use proptest::prelude::*;
 
 #[test]
@@ -116,6 +116,46 @@ fn is_public_ip_blocks_all_private_local_and_metadata_ranges() {
 
     for ip in public {
         assert!(is_public_ip(ip), "is_public_ip should allow {ip}");
+    }
+}
+
+#[test]
+fn validate_llms_redirect_target_allows_public_https_and_blocks_ssrf_hops() {
+    let origin = build_llms_txt_url("docs.pydantic.dev", false);
+    assert!(origin.is_ok());
+    if let Ok(origin) = origin {
+        // Legitimate cross-host redirect (subdomain -> apex domain)
+        let ok_apex = validate_llms_redirect_target(
+            &origin,
+            "https://pydantic.dev/docs/validation/latest/llms.txt",
+        );
+        assert_eq!(
+            ok_apex.map(|u| u.to_string()).as_deref(),
+            Ok("https://pydantic.dev/docs/validation/latest/llms.txt")
+        );
+
+        // Legitimate relative redirect
+        let ok_rel = validate_llms_redirect_target(&origin, "/latest/llms.txt");
+        assert_eq!(
+            ok_rel.map(|u| u.to_string()).as_deref(),
+            Ok("https://docs.pydantic.dev/latest/llms.txt")
+        );
+
+        // Hostile redirect targets must all be rejected
+        for bad in [
+            "http://pydantic.dev/llms.txt",
+            "https://169.254.169.254/latest/meta-data/",
+            "https://127.0.0.1/llms.txt",
+            "https://localhost/llms.txt",
+            "https://db.internal/llms.txt",
+            "https://pydantic.dev:8443/llms.txt",
+            "https://user:pass@pydantic.dev/llms.txt",
+        ] {
+            assert!(
+                validate_llms_redirect_target(&origin, bad).is_err(),
+                "redirect target {bad:?} must be rejected"
+            );
+        }
     }
 }
 
