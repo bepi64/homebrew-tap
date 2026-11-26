@@ -111,6 +111,14 @@ Architecture Decision Records (ADRs) and open questions for `fast-docs` (`homebr
 - **Decision:** Handle `llms.txt` redirects hop by hop (`fetch_llms_with_safe_redirects`) re-validating HTTPS, public hostname, DNS resolution, and public-IP pinning on each hop; infer ecosystem from `project_dir` manifests (`detect_project_ecosystem`) before falling back to `detect_lang`; preserve `H1 > H2` heading breadcrumbs in `parse_markdown_sections`; and append a `Modules` hint on 404 submodule lookups.
 - **Rationale:** Fixes legitimate cross-host redirects like `docs.pydantic.dev/llms.txt` → `pydantic.dev/docs/validation/latest/llms.txt` without weakening SSRF or DNS-rebinding defenses, prevents homonym collisions (e.g., Python `ruff` vs Rust crate `ruff`) when `project_dir` is provided, and ensures `llms-full.txt` subsections like `# CORS Middleware` / `## Usage` retain parent topic context.
 
+### D-19: Multi-Ecosystem QA Hardening (Lockfiles, Strict `lang`, RST/Go/Rustdoc, PyPI RSS, Anti-Changelog)
+- **Status:** Accepted (2026-11-26)
+- **Decision:** Following parallel E2E QA across four real repositories (`sharkdp/fd`, `encode/httpx`, `spf13/cobra`, `honojs/hono`):
+  - Added `pnpm-lock.yaml`, `requirements.txt`, unique Go short-name resolution from `go.mod`, and an exact-pin policy for un-locked manifests (`DepMatch`).
+  - Made `lang` validation strict (rejecting typos instead of silent fallback) and expanded Go auto-detection to vanity imports and stdlib packages.
+  - Combined `div.UnitReadme-content` + `div.Documentation-content` on `pkg.go.dev`, extracted rustdoc method signatures cleanly (stripping line numbers and preserving `->`), added RST heading/`.. code-block::` parsing, preserved original fence languages, demoted changelog/migration sections, indexed local file paths, excluded `.github/`, and emitted pagination footers from `offset=0`.
+  - Added a ~12 KiB `pypi.org/rss/project/<pkg>/releases.xml` fallback when unpinned `/pypi/<pkg>/json` exceeds 5 MiB (e.g. `ruff`), parallel `struct.`/`trait.`/`enum.` fallback for Rust `::` item paths (`builder::Command`, `ser::Serialize`), and cleaner `search_docs` formatting.
+
 ## Open Questions
 
 - **Q-01 (v1.0.0 release publication):** `Cargo.toml` and `USER_AGENT` are now at `1.0.0`. Once pushed to GitHub (`https://github.com/bepi64/homebrew-tap`) and tagged `v1.0.0`, replace the placeholder `sha256` in `Formula/fast-docs.rb` with the real release archive checksum, then run `brew audit --strict --new Formula/fast-docs.rb`, `brew install --build-from-source Formula/fast-docs.rb`, and `brew test fast-docs`.

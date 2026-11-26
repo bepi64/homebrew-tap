@@ -1,9 +1,10 @@
 use std::fmt::Write as _;
 
 use fast_docs::tools::{
-    clamp_max_chars, detect_lang, extract_pypi_candidate, html_to_context7,
-    html_to_context7_with_options, markdown_to_context7, markdown_to_context7_with_options,
-    parse_ecosystem_arg, parse_pypi_json_to_context7, resolve_go_module, slice_with_pagination,
+    clamp_max_chars, detect_lang, extract_latest_version_from_pypi_rss, extract_pypi_candidate,
+    html_to_context7, html_to_context7_with_options, markdown_to_context7,
+    markdown_to_context7_with_options, parse_ecosystem_arg, parse_pypi_json_to_context7,
+    resolve_go_module, rustdoc_item_fallback_urls, slice_with_pagination, split_rust_release_name,
     strip_html_tags, truncate_smart, urlencoding, Ecosystem, MAX_ALLOWED_OUTPUT_CHARS,
     MAX_OUTPUT_CHARS, MIN_OUTPUT_CHARS,
 };
@@ -612,6 +613,61 @@ fn pagination_footer_appears_at_offset_zero_when_output_is_truncated() {
     );
 }
 
+#[test]
+fn extract_latest_version_from_pypi_rss_picks_first_item_version() {
+    let rss = r"<rss><channel><title>PyPI recent updates for ruff</title><item><title>0.17.6</title></item><item><title>0.17.5</title></item></channel></rss>";
+    assert_eq!(
+        extract_latest_version_from_pypi_rss(rss).as_deref(),
+        Some("0.17.6")
+    );
+    assert_eq!(extract_latest_version_from_pypi_rss("<rss></rss>"), None);
+}
+
+#[test]
+fn rustdoc_item_fallback_urls_builds_struct_trait_enum_candidates() {
+    let clap = rustdoc_item_fallback_urls("clap", "4.6.7", "builder::Command");
+    assert_eq!(
+        clap,
+        vec![
+            "https://docs.rs/clap/4.6.7/clap/builder/struct.Command.html",
+            "https://docs.rs/clap/4.6.7/clap/builder/trait.Command.html",
+            "https://docs.rs/clap/4.6.7/clap/builder/enum.Command.html",
+        ]
+    );
+
+    let crossbeam = rustdoc_item_fallback_urls("crossbeam-channel", "0.5.17", "Sender");
+    assert_eq!(
+        crossbeam,
+        vec![
+            "https://docs.rs/crossbeam-channel/0.5.17/crossbeam_channel/struct.Sender.html",
+            "https://docs.rs/crossbeam-channel/0.5.17/crossbeam_channel/trait.Sender.html",
+            "https://docs.rs/crossbeam-channel/0.5.17/crossbeam_channel/enum.Sender.html",
+        ]
+    );
+
+    assert_eq!(
+        rustdoc_item_fallback_urls("tokio", "latest", "sync"),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        rustdoc_item_fallback_urls("tokio", "latest", "sync/struct.RwLock.html"),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn split_rust_release_name_separates_crate_and_version() {
+    assert_eq!(
+        split_rust_release_name("globset-0.4.22"),
+        ("globset", Some("0.4.22"))
+    );
+    assert_eq!(
+        split_rust_release_name("crossbeam-channel-0.5.17"),
+        ("crossbeam-channel", Some("0.5.17"))
+    );
+    assert_eq!(split_rust_release_name("tokio"), ("tokio", None));
+}
+
 proptest! {
     #[test]
     fn urlencoding_emits_only_safe_ascii_and_preserves_unreserved(s in ".*") {
@@ -663,9 +719,9 @@ proptest! {
             Ecosystem::Python,
             "demo",
         );
-        // Either fits within MAX_OUTPUT_CHARS or ends with truncation marker
-        let suffix = "\n... (truncated)";
-        let effective = out.strip_suffix(suffix).unwrap_or(&out);
+        let effective = out
+            .split_once("\n\n[showing bytes ")
+            .map_or(out.as_str(), |(body, _)| body);
         prop_assert!(effective.len() <= MAX_OUTPUT_CHARS);
     }
 
@@ -685,8 +741,9 @@ proptest! {
             Some(&topic),
             Some(budget),
         );
-        let suffix = "\n... (truncated)";
-        let effective = out.strip_suffix(suffix).unwrap_or(&out);
+        let effective = out
+            .split_once("\n\n[showing bytes ")
+            .map_or(out.as_str(), |(body, _)| body);
         prop_assert!(effective.len() <= clamped);
     }
 }

@@ -536,6 +536,77 @@ fn validate_module_path(raw: &str, ecosystem: Ecosystem) -> Result<String, Strin
     Ok(normalized)
 }
 
+/// Extract the latest release version from a `PyPI` RSS feed
+/// (`https://pypi.org/rss/project/<pkg>/releases.xml`), which is ~12 KiB even for packages whose
+/// full `/pypi/<pkg>/json` payload exceeds the 5 MiB response cap.
+#[must_use]
+pub fn extract_latest_version_from_pypi_rss(rss: &str) -> Option<String> {
+    let after_item = rss.split_once("<item>")?.1;
+    let after_title = after_item.split_once("<title>")?.1;
+    let title = after_title.split_once("</title>")?.0.trim();
+    validate_version(title).ok().map(ToOwned::to_owned)
+}
+
+/// Build candidate `docs.rs` item URLs (`struct.`, `trait.`, `enum.`) when a Rust `module` path
+/// ends with an `UpperCamelCase` item identifier (such as `builder::Command` or `ser::Serialize`).
+#[must_use]
+pub fn rustdoc_item_fallback_urls(library: &str, version: &str, module: &str) -> Vec<String> {
+    let Ok(library) = validate_library_name(library, Ecosystem::Rust) else {
+        return Vec::new();
+    };
+    let Ok(version) = validate_version(version) else {
+        return Vec::new();
+    };
+    let Ok(normalized) = validate_module_path(module.trim(), Ecosystem::Rust) else {
+        return Vec::new();
+    };
+    if Path::new(&normalized)
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("html"))
+    {
+        return Vec::new();
+    }
+
+    let (parent, item) = match normalized.rsplit_once('/') {
+        Some((p, i)) => (Some(p), i),
+        None => (None, normalized.as_str()),
+    };
+    if !item.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+        return Vec::new();
+    }
+
+    let crate_ident = library.replace('-', "_");
+    let mut urls = Vec::with_capacity(3);
+    for kind in ["struct", "trait", "enum"] {
+        let candidate = match parent {
+            Some(p) => {
+                format!("https://docs.rs/{library}/{version}/{crate_ident}/{p}/{kind}.{item}.html")
+            }
+            None => format!("https://docs.rs/{library}/{version}/{crate_ident}/{kind}.{item}.html"),
+        };
+        if validate_outbound_url(&candidate).is_ok() {
+            urls.push(candidate);
+        }
+    }
+    urls
+}
+
+/// Split a `docs.rs` search release label such as `"globset-0.4.22"` into `("globset", Some("0.4.22"))`.
+#[must_use]
+pub fn split_rust_release_name(raw: &str) -> (&str, Option<&str>) {
+    let trimmed = raw.trim();
+    for (idx, _) in trimmed.match_indices('-') {
+        let after = &trimmed[idx + 1..];
+        if after.chars().next().is_some_and(|c| c.is_ascii_digit())
+            && after.contains('.')
+            && idx > 0
+        {
+            return (&trimmed[..idx], Some(after));
+        }
+    }
+    (trimmed, None)
+}
+
 /// Extract a valid `PyPI` exact-match package candidate from a single- or multi-word search query
 /// (for example `"pytest fixtures"` → `Some("pytest")`).
 #[must_use]
@@ -2009,12 +2080,21 @@ impl FastDocsServer {
             let Some(name_el) = el.select(&name_sel).next() else {
                 continue;
             };
-            let name = clean_inline_text(&name_el);
+            let raw_name = clean_inline_text(&name_el);
+            let (crate_name, ver) = split_rust_release_name(&raw_name);
             let desc = el
                 .select(&desc_sel)
                 .next()
                 .map_or_default(|d| clean_inline_text(&d));
-            entries.push(format!("- **{name}** (rust): {desc}"));
+            let label = match ver {
+                Some(v) => format!("**{crate_name}** (rust, {v})"),
+                None => format!("**{crate_name}** (rust)"),
+            };
+            if desc.is_empty() {
+                entries.push(format!("- {label}"));
+            } else {
+                entries.push(format!("- {label}: {desc}"));
+            }
         }
 
         if entries.is_empty() {
@@ -2039,7 +2119,10 @@ impl FastDocsServer {
             let name = json["info"]["name"].as_str().unwrap_or(candidate);
             let ver = json["info"]["version"].as_str().unwrap_or("latest");
             let sum = json["info"]["summary"].as_str().unwrap_or("");
-            Some(format!("- **{name}-{ver}** (python / PyPI exact): {sum}"))
+            Some((
+                name.to_ascii_lowercase(),
+                format!("- **{name}** (python, {ver}, PyPI exact): {sum}"),
+            ))
         };
 
         let gh_url = format!(
@@ -2050,8 +2133,10 @@ impl FastDocsServer {
         let (exact_entry, gh_res) = tokio::join!(exact_fut, gh_fut);
 
         let mut py_entries: Vec<String> = Vec::new();
-        if let Some(exact) = exact_entry {
-            py_entries.push(exact);
+        let mut exact_pkg_lower: Option<String> = None;
+        if let Some((pkg_lower, formatted)) = exact_entry {
+            exact_pkg_lower = Some(pkg_lower);
+            py_entries.push(formatted);
         }
 
         match gh_res {
@@ -2059,10 +2144,23 @@ impl FastDocsServer {
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
                     if let Some(items) = json["items"].as_array() {
                         for item in items.iter().take(6) {
-                            let name = item["name"].as_str().unwrap_or("");
+                            let short_name = item["name"].as_str().unwrap_or("");
+                            let full_name = item["full_name"].as_str().unwrap_or(short_name);
                             let desc = item["description"].as_str().unwrap_or("");
-                            if !name.is_empty() {
-                                py_entries.push(format!("- **{name}** (python): {desc}"));
+                            if short_name.is_empty() {
+                                continue;
+                            }
+                            if exact_pkg_lower
+                                .as_deref()
+                                .is_some_and(|e| e.eq_ignore_ascii_case(short_name))
+                            {
+                                continue;
+                            }
+                            if desc.is_empty() {
+                                py_entries.push(format!("- **{full_name}** (python / GitHub)"));
+                            } else {
+                                py_entries
+                                    .push(format!("- **{full_name}** (python / GitHub): {desc}"));
                             }
                         }
                     }
@@ -2075,7 +2173,10 @@ impl FastDocsServer {
         if py_entries.is_empty() {
             Ok(None)
         } else {
-            Ok(Some(format!("## Python (PyPI)\n{}", py_entries.join("\n"))))
+            Ok(Some(format!(
+                "## Python (PyPI / GitHub)\n{}",
+                py_entries.join("\n")
+            )))
         }
     }
 
@@ -2102,7 +2203,11 @@ impl FastDocsServer {
                 .select(&syn_sel)
                 .next()
                 .map_or_default(|p| clean_inline_text(&p));
-            entries.push(format!("- **{header}** (go): {syn}"));
+            if syn.is_empty() {
+                entries.push(format!("- **{header}** (go)"));
+            } else {
+                entries.push(format!("- **{header}** (go): {syn}"));
+            }
         }
 
         if entries.is_empty() {
@@ -2185,6 +2290,65 @@ impl FastDocsServer {
             parse_markdown_doc(readme, summary, page_url, Ecosystem::Npm, library),
             etag,
         ))
+    }
+
+    /// Fallback for large `PyPI` packages (such as `ruff`) whose unpinned `/pypi/<pkg>/json`
+    /// exceeds 5 MiB because of historical `releases`: fetch the ~12 KiB RSS releases feed to
+    /// discover the latest version, then fetch the compact `/pypi/<pkg>/<ver>/json`.
+    async fn fetch_pypi_via_rss_fallback(
+        &self,
+        library: &str,
+    ) -> Result<(ParsedDoc, Option<String>), String> {
+        let rss_url = format!("https://pypi.org/rss/project/{library}/releases.xml");
+        let rss_body = self.fetch_allowlisted(&rss_url).await?;
+        let latest_ver = extract_latest_version_from_pypi_rss(&rss_body)
+            .ok_or_else(|| "could not determine latest version from PyPI RSS feed".to_string())?;
+        let pinned_url = build_url(library, &latest_ver, Ecosystem::Python)?;
+        let FetchOutcome::Fetched {
+            body,
+            etag,
+            final_url,
+        } = self
+            .fetch_allowlisted_conditional(&pinned_url, None)
+            .await?
+        else {
+            return Err("unexpected 304 on PyPI versioned fallback".to_string());
+        };
+        let parsed = parse_pypi_json_doc(&body, &final_url, library)
+            .unwrap_or_else(|| parse_html_doc(&body, &final_url, Ecosystem::Python, library));
+        Ok((parsed, etag))
+    }
+
+    /// Fallback for `docs.rs` Rust `::` item paths (e.g. `builder::Command` -> `struct.Command.html`).
+    async fn fetch_rustdoc_item_fallback(
+        &self,
+        library: &str,
+        version: &str,
+        module: &str,
+    ) -> Option<(ParsedDoc, Option<String>)> {
+        let candidates = rustdoc_item_fallback_urls(library, version, module);
+        if candidates.len() != 3 {
+            return None;
+        }
+        let (r0, r1, r2) = tokio::join!(
+            self.fetch_allowlisted_conditional(&candidates[0], None),
+            self.fetch_allowlisted_conditional(&candidates[1], None),
+            self.fetch_allowlisted_conditional(&candidates[2], None),
+        );
+        for outcome in [r0, r1, r2] {
+            if let Ok(FetchOutcome::Fetched {
+                body,
+                etag,
+                final_url,
+            }) = outcome
+            {
+                return Some((
+                    parse_html_doc(&body, &final_url, Ecosystem::Rust, library),
+                    etag,
+                ));
+            }
+        }
+        None
     }
 }
 
@@ -2321,7 +2485,8 @@ impl FastDocsServer {
                     let rendered =
                         parsed.render_paginated(effective_topic.as_deref(), max_chars, offset);
                     return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                        "# {label} (cached)\n\n{rendered}"
+                        "# {label} ({}, cached)\n\n{rendered}",
+                        ecosystem.as_str()
                     ))]));
                 }
                 stale_parsed = Some(parsed);
@@ -2414,6 +2579,58 @@ impl FastDocsServer {
                         ),
                     )])),
                 }
+            }
+            Err(err)
+                if ecosystem == Ecosystem::Python
+                    && !is_pinned
+                    && err.contains("exceeds maximum allowed size") =>
+            {
+                match self.fetch_pypi_via_rss_fallback(&effective_library).await {
+                    Ok((parsed, etag)) => {
+                        if let Some(cache) = &self.cache {
+                            if let Ok(serialized) = serde_json::to_string(&parsed) {
+                                let _ = cache.put_with_etag(&url, &serialized, false, etag.as_deref());
+                            }
+                        }
+                        let rendered =
+                            parsed.render_paginated(effective_topic.as_deref(), max_chars, offset);
+                        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                            "# {label} (python)\n\n{rendered}"
+                        ))]))
+                    }
+                    Err(fb_err) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                        "Documentation not found for {label} (python): {err}; RSS fallback: {fb_err}"
+                    ))])),
+                }
+            }
+            Err(err)
+                if ecosystem == Ecosystem::Rust && err == "HTTP 404" && req.module.is_some() =>
+            {
+                if let Some(module_str) = req.module.as_deref() {
+                    if let Some((parsed, etag)) = self
+                        .fetch_rustdoc_item_fallback(&effective_library, &version, module_str)
+                        .await
+                    {
+                        if let Some(cache) = &self.cache {
+                            if let Ok(serialized) = serde_json::to_string(&parsed) {
+                                let _ = cache.put_with_etag(
+                                    &url,
+                                    &serialized,
+                                    is_pinned,
+                                    etag.as_deref(),
+                                );
+                            }
+                        }
+                        let rendered =
+                            parsed.render_paginated(effective_topic.as_deref(), max_chars, offset);
+                        return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                            "# {label} (rust)\n\n{rendered}"
+                        ))]));
+                    }
+                }
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                    "Documentation not found for {label} (rust): {err} (Tip: call fetch_docs without 'module' to inspect the library's available Modules/Items table.)"
+                ))]))
             }
             Err(err) => {
                 let module_hint = if err == "HTTP 404" && req.module.is_some() {
