@@ -163,7 +163,7 @@ pub struct FetchDocsRequest {
     )]
     pub max_chars: Option<usize>,
     #[schemars(
-        description = "Optional local project directory path used to auto-resolve the library version from Cargo.lock, Cargo.toml, package.json, pyproject.toml, or go.mod when version is omitted"
+        description = "Optional local project directory path used to auto-resolve the library version from Cargo.lock, Cargo.toml, package-lock.json, package.json, uv.lock, pyproject.toml, or go.mod when version is omitted"
     )]
     pub project_dir: Option<String>,
     #[schemars(
@@ -673,6 +673,8 @@ struct ParsedDoc {
     fallback: String,
     source_url: String,
     lang: String,
+    #[serde(default)]
+    metadata: Vec<String>,
 }
 
 impl ParsedDoc {
@@ -681,29 +683,43 @@ impl ParsedDoc {
     }
 
     fn render_paginated(&self, topic: Option<&str>, max_chars: usize, offset: usize) -> String {
+        let prefix = if self.metadata.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n\n", self.metadata.join("\n"))
+        };
+
         if self.sections.is_empty() {
+            let combined = format!("{prefix}{}", self.fallback);
             if offset > 0 {
-                return slice_with_pagination(&self.fallback, offset, max_chars);
+                return slice_with_pagination(&combined, offset, max_chars);
             }
-            return truncate_smart(&self.fallback, max_chars);
+            return truncate_smart(&combined, max_chars);
         }
+
         if offset > 0 {
-            return render_doc_sections_paginated(
-                &self.sections,
-                &self.source_url,
-                &self.lang,
-                topic,
-                max_chars,
-                offset,
+            let full = format!(
+                "{prefix}{}",
+                format_sections_all(
+                    &self.sections,
+                    &self.source_url,
+                    &self.lang,
+                    topic,
+                    256 * 1024,
+                )
             );
+            return slice_with_pagination(&full, offset, max_chars);
         }
-        render_context7_sections(
+
+        let body_budget = max_chars.saturating_sub(prefix.len());
+        let body = render_context7_sections(
             &self.sections,
             &self.source_url,
             &self.lang,
             topic,
-            max_chars,
-        )
+            body_budget,
+        );
+        truncate_smart(&format!("{prefix}{body}"), max_chars)
     }
 }
 
@@ -754,6 +770,7 @@ fn parse_html_doc(html: &str, source_url: &str, ecosystem: Ecosystem, lib_name: 
             fallback: clean_inline_text(&doc.root_element()),
             source_url: source_url.to_string(),
             lang: ecosystem.as_str().to_string(),
+            metadata: Vec::new(),
         };
     };
 
@@ -844,6 +861,7 @@ fn parse_html_doc(html: &str, source_url: &str, ecosystem: Ecosystem, lib_name: 
         fallback,
         source_url: source_url.to_string(),
         lang: ecosystem.as_str().to_string(),
+        metadata: Vec::new(),
     }
 }
 
@@ -1035,6 +1053,7 @@ fn parse_markdown_doc(
         fallback: String::new(),
         source_url: source_url.to_string(),
         lang: ecosystem.as_str().to_string(),
+        metadata: Vec::new(),
     }
 }
 
@@ -1106,21 +1125,7 @@ fn parse_pypi_json_doc(body: &str, fallback_url: &str, lib_name: &str) -> Option
         meta_lines.push(format!("Homepage: {home}"));
     }
 
-    if !meta_lines.is_empty() {
-        if let Some(first) = parsed.sections.first_mut() {
-            for line in meta_lines.into_iter().rev() {
-                first.descriptions.insert(0, line);
-            }
-        } else {
-            parsed.sections.push(DocSection {
-                title: format!("{lib_name} Overview"),
-                descriptions: meta_lines,
-                codes: Vec::new(),
-                source: None,
-            });
-        }
-    }
-
+    parsed.metadata = meta_lines;
     Some(parsed)
 }
 
@@ -1318,18 +1323,25 @@ fn format_sections_all(
             }
         }
         if scored.is_empty() {
-            if let Some(raw_topic) = topic {
-                let _ = writeln!(
-                    out,
-                    "Note: No sections matched topic '{}'; showing overview sections instead.\n",
-                    raw_topic.trim()
+            let raw_topic = topic.map_or("", str::trim);
+            let _ = writeln!(out, "No sections matched topic '{raw_topic}'.");
+            if !sections.is_empty() {
+                out.push_str("\nAvailable sections:\n");
+                let mut seen = Vec::new();
+                for section in sections.iter().take(40) {
+                    if !seen.contains(&section.title) {
+                        seen.push(section.title.clone());
+                        let _ = writeln!(out, "- {}", section.title);
+                    }
+                }
+                out.push_str(
+                    "\nTip: retry without `topic` or with one of the section titles above.",
                 );
             }
-            default_section_order(sections)
-        } else {
-            scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-            scored.into_iter().map(|(_, _, section)| section).collect()
+            return out.trim().to_string();
         }
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        scored.into_iter().map(|(_, _, section)| section).collect()
     };
 
     for section in ordered {
@@ -2161,6 +2173,7 @@ impl FastDocsServer {
                     fallback: String::new(),
                     source_url: resolved_url.clone(),
                     lang: "markdown".to_string(),
+                    metadata: Vec::new(),
                 };
                 if let Some(cache) = &self.cache {
                     if let Ok(serialized) = serde_json::to_string(&parsed) {

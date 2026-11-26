@@ -153,13 +153,15 @@ let r = lock.read().await;
 }
 
 #[test]
-fn topic_filtering_falls_back_gracefully_when_no_section_matches() {
+fn topic_filtering_returns_table_of_contents_when_no_section_matches() {
     let html = r#"
     <html><body>
       <div class="docblock">
         <h1>Overview</h1>
         <p>Core documentation for the demo crate with basic usage examples.</p>
         <pre>let x = demo::start();</pre>
+        <h2>Authentication</h2>
+        <p>Token configuration details.</p>
       </div>
     </body></html>
     "#;
@@ -174,7 +176,13 @@ fn topic_filtering_falls_back_gracefully_when_no_section_matches() {
     );
 
     assert!(rendered.contains("No sections matched topic"));
-    assert!(rendered.contains("TITLE: Overview"));
+    assert!(rendered.contains("Available sections:"));
+    assert!(rendered.contains("- Overview"));
+    assert!(rendered.contains("- Authentication"));
+    assert!(
+        !rendered.contains("demo::start()"),
+        "unmatched topic must not dump unrelated body content: {rendered}"
+    );
 }
 
 #[test]
@@ -302,7 +310,7 @@ fn html_to_context7_extracts_rustdoc_module_tables() {
 }
 
 #[test]
-fn pypi_json_includes_official_documentation_project_urls() {
+fn pypi_json_includes_official_documentation_project_urls_even_with_topic() {
     let pypi_json = r##"{
       "info": {
         "name": "requests",
@@ -313,7 +321,7 @@ fn pypi_json_includes_official_documentation_project_urls() {
           "Documentation": "https://requests.readthedocs.io",
           "Source": "https://github.com/psf/requests"
         },
-        "description": "# Requests\nSimple HTTP library for Python."
+        "description": "# Requests\nSimple HTTP library for Python.\n# Features\n- Basic & Digest Authentication\n- Connection Timeouts"
       }
     }"##;
 
@@ -321,13 +329,17 @@ fn pypi_json_includes_official_documentation_project_urls() {
         pypi_json,
         "https://pypi.org/pypi/requests/json",
         "requests",
-        None,
+        Some("authentication"),
         None,
     );
     assert!(rendered.is_some());
     if let Some(text) = rendered {
-        assert!(text.contains("https://requests.readthedocs.io"));
+        assert!(
+            text.contains("https://requests.readthedocs.io"),
+            "Documentation project URL must remain visible even when topic filters sections: {text}"
+        );
         assert!(text.contains("2.32.3"));
+        assert!(text.contains("Basic & Digest Authentication"));
     }
 }
 

@@ -101,6 +101,11 @@ Architecture Decision Records (ADRs) and open questions for `fast-docs` (`homebr
 - **Decision:** Replace binary substring topic matching and hard per-section `.take(4)` / 450-char truncation with word-boundary multi-term scoring (`count_word_hits` + quadratic distinct-term coverage bonus), intra-section line/code filtering when `topic` is set, rustdoc `h2.section-header` + `dl.item-table` extraction, PyPI `project_urls` surfacing (`parse_pypi_json_doc`), and resolved `final_url` capture in `FetchOutcome::Fetched`.
 - **Rationale:** Real-world testing against `tokio`, `hono.dev/llms.txt`, `requests`, and `zod` exposed that `.take(4)` + 450-char truncation discarded deep matching lines (such as `routing` in `hono.dev/llms.txt`) and produced pervasive `... (truncated)` markers well below the 6,500-char budget, while `@latest` redirects hid the actual served version (`zod@4.6.7`, `tokio/1.54.1`).
 
+### D-17: Lockfile Priority (`uv.lock`, `package-lock.json`), Persistent PyPI Metadata Banner, and Unmatched-Topic Table of Contents
+- **Status:** Accepted (2026-11-26)
+- **Decision:** Prioritize `uv.lock` before `pyproject.toml` (PEP 503 matching) and `package-lock.json` (v1/v2/v3) before `package.json` in `src/manifest.rs` (capped at 5 MiB); store PyPI `version` and `project_urls` in a persistent `ParsedDoc.metadata` header rendered even when `topic` filters sections; and return a compact `Available sections:` table of contents instead of dumping unrelated overview prose when a `topic` matches zero sections.
+- **Rationale:** Ensures exact locked versions across Rust, Python, and npm projects; keeps official external documentation links (e.g. ReadTheDocs) visible to MCP clients during topic-filtered Python lookups so they can follow up with `fetch_llms_txt`; and eliminates context noise when a lexical `topic` misses.
+
 ## Open Questions
 
 - **Q-01 (v1.0.0 release publication):** `Cargo.toml` and `USER_AGENT` are now at `1.0.0`. Once pushed to GitHub (`https://github.com/bepi64/homebrew-tap`) and tagged `v1.0.0`, replace the placeholder `sha256` in `Formula/fast-docs.rb` with the real release archive checksum, then run `brew audit --strict --new Formula/fast-docs.rb`, `brew install --build-from-source Formula/fast-docs.rb`, and `brew test fast-docs`.

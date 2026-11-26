@@ -3,8 +3,8 @@ use std::path::Path;
 
 use crate::tools::{resolve_go_module, Ecosystem};
 
-/// Maximum manifest file size read from disk (2 MiB) to avoid unbounded memory reads.
-const MAX_MANIFEST_BYTES: u64 = 2 * 1024 * 1024;
+/// Maximum manifest or lockfile size read from disk (5 MiB) to avoid unbounded memory reads.
+const MAX_MANIFEST_BYTES: u64 = 5 * 1024 * 1024;
 
 /// Version resolved from a local project manifest or lockfile.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -298,8 +298,65 @@ fn resolve_from_go_mod(content: &str, library: &str) -> Option<String> {
     None
 }
 
+fn resolve_from_package_lock(content: &str, library: &str) -> Option<String> {
+    let json = serde_json::from_str::<serde_json::Value>(content).ok()?;
+    let node_modules_key = format!("node_modules/{library}");
+
+    // Lockfile v2 / v3: `packages["node_modules/<pkg>"].version`
+    if let Some(ver) = json
+        .get("packages")
+        .and_then(|pkgs| pkgs.get(&node_modules_key))
+        .and_then(|entry| entry.get("version"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(normalize_version_spec)
+    {
+        return Some(ver);
+    }
+
+    // Lockfile v1 fallback: `dependencies["<pkg>"].version`
+    json.get("dependencies")
+        .and_then(|deps| deps.get(library))
+        .and_then(|entry| entry.get("version"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(normalize_version_spec)
+}
+
+fn resolve_from_uv_lock(content: &str, library: &str) -> Option<String> {
+    let target = normalize_pep503(library);
+    let mut in_package = false;
+    let mut current_name: Option<String> = None;
+
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        if line == "[[package]]" {
+            in_package = true;
+            current_name = None;
+            continue;
+        }
+        if line.starts_with('[') {
+            in_package = false;
+            current_name = None;
+            continue;
+        }
+        if !in_package {
+            continue;
+        }
+        if line.starts_with("name") {
+            if let Some(val) = extract_quoted_value(line) {
+                current_name = Some(normalize_pep503(val));
+            }
+        } else if line.starts_with("version") && current_name.as_deref() == Some(target.as_str()) {
+            if let Some(val) = extract_quoted_value(line) {
+                return normalize_version_spec(val);
+            }
+        }
+    }
+    None
+}
+
 /// Resolve the pinned or declared version of `library` from local project manifests inside
-/// `project_dir` (`Cargo.lock`, `Cargo.toml`, `package.json`, `pyproject.toml`, or `go.mod`).
+/// `project_dir` (`Cargo.lock`, `Cargo.toml`, `package-lock.json`, `package.json`, `uv.lock`,
+/// `pyproject.toml`, or `go.mod`).
 #[must_use]
 pub fn resolve_project_version(
     project_dir: &Path,
@@ -328,6 +385,14 @@ pub fn resolve_project_version(
             })
         }
         Ecosystem::Npm => {
+            if let Some(lock) = read_bounded_manifest(&project_dir.join("package-lock.json")) {
+                if let Some(version) = resolve_from_package_lock(&lock, library) {
+                    return Some(ResolvedDependency {
+                        version,
+                        source_file: "package-lock.json",
+                    });
+                }
+            }
             let pkg = read_bounded_manifest(&project_dir.join("package.json"))?;
             let version = resolve_from_package_json(&pkg, library)?;
             Some(ResolvedDependency {
@@ -336,6 +401,14 @@ pub fn resolve_project_version(
             })
         }
         Ecosystem::Python => {
+            if let Some(lock) = read_bounded_manifest(&project_dir.join("uv.lock")) {
+                if let Some(version) = resolve_from_uv_lock(&lock, library) {
+                    return Some(ResolvedDependency {
+                        version,
+                        source_file: "uv.lock",
+                    });
+                }
+            }
             let pyproject = read_bounded_manifest(&project_dir.join("pyproject.toml"))?;
             let version = resolve_from_pyproject_toml(&pyproject, library)?;
             Some(ResolvedDependency {

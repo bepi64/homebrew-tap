@@ -115,6 +115,84 @@ fn resolves_npm_version_from_package_json_and_ignores_non_semver_specs() {
 }
 
 #[test]
+fn resolves_npm_version_preferring_package_lock_over_package_json() {
+    let dir = unique_project_dir("npm-lock");
+    assert!(fs::create_dir_all(&dir).is_ok());
+
+    let package_json = r#"{
+  "dependencies": {
+    "zod": "^3.20.0",
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  }
+}"#;
+    let package_lock = r#"{
+  "name": "web-app",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "web-app" },
+    "node_modules/zod": { "version": "3.24.4" },
+    "node_modules/@modelcontextprotocol/sdk": { "version": "1.32.2" }
+  }
+}"#;
+    assert!(fs::write(dir.join("package.json"), package_json).is_ok());
+    assert!(fs::write(dir.join("package-lock.json"), package_lock).is_ok());
+
+    let zod = resolve_project_version(&dir, "zod", Ecosystem::Npm);
+    assert_eq!(zod.as_ref().map(|r| r.version.as_str()), Some("3.24.4"));
+    assert_eq!(
+        zod.as_ref().map(|r| r.source_file),
+        Some("package-lock.json")
+    );
+
+    let mcp = resolve_project_version(&dir, "@modelcontextprotocol/sdk", Ecosystem::Npm);
+    assert_eq!(mcp.as_ref().map(|r| r.version.as_str()), Some("1.32.2"));
+    assert_eq!(
+        mcp.as_ref().map(|r| r.source_file),
+        Some("package-lock.json")
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn resolves_python_version_preferring_uv_lock_over_pyproject_toml() {
+    let dir = unique_project_dir("uv-lock");
+    assert!(fs::create_dir_all(&dir).is_ok());
+
+    let pyproject = r#"
+[project]
+dependencies = ["httpx>=0.27.0", "scikit-learn>=1.5.0"]
+"#;
+    let uv_lock = r#"
+version = 1
+
+[[package]]
+name = "httpx"
+version = "0.28.1"
+
+[[package]]
+name = "httpx2"
+version = "2.16.0"
+
+[[package]]
+name = "scikit-learn"
+version = "1.6.2"
+"#;
+    assert!(fs::write(dir.join("pyproject.toml"), pyproject).is_ok());
+    assert!(fs::write(dir.join("uv.lock"), uv_lock).is_ok());
+
+    let httpx = resolve_project_version(&dir, "httpx", Ecosystem::Python);
+    assert_eq!(httpx.as_ref().map(|r| r.version.as_str()), Some("0.28.1"));
+    assert_eq!(httpx.as_ref().map(|r| r.source_file), Some("uv.lock"));
+
+    let sklearn = resolve_project_version(&dir, "scikit_learn", Ecosystem::Python);
+    assert_eq!(sklearn.as_ref().map(|r| r.version.as_str()), Some("1.6.2"));
+    assert_eq!(sklearn.as_ref().map(|r| r.source_file), Some("uv.lock"));
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn resolves_python_version_from_pyproject_toml_with_pep503_normalization() {
     let dir = unique_project_dir("python");
     assert!(fs::create_dir_all(&dir).is_ok());
