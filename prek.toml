@@ -1,0 +1,25 @@
+# Configuration file for `prek`, a fast Git hook manager written in Rust.
+# See https://prek.j178.dev for more information.
+#:schema https://www.schemastore.org/prek.json
+
+[[repos]]
+repo = "builtin"
+hooks = [
+    { id = "trailing-whitespace" },
+    { id = "end-of-file-fixer" },
+    { id = "check-added-large-files" },
+    { id = "check-merge-conflict" },
+    { id = "check-toml" },
+    { id = "check-yaml" },
+    { id = "detect-private-key" },
+]
+
+[[repos]]
+repo = "local"
+hooks = [
+    { id = "cargo-fmt", name = "cargo fmt", entry = "cargo fmt -- --check", language = "system", types = ["rust"], pass_filenames = false },
+    { id = "cargo-clippy", name = "cargo clippy", entry = "cargo clippy --all-targets --all-features -- -D warnings", language = "system", types = ["rust"], pass_filenames = false },
+    { id = "shellcheck", name = "shellcheck", entry = "shellcheck", language = "system", types = ["shell"] },
+    { id = "shfmt", name = "shfmt", entry = "shfmt -i 2 -d", language = "system", types = ["shell"] },
+    { id = "brew-style", name = "brew style", entry = "brew style", language = "system", files = "^Formula/.*\\.rb$" },
+]
