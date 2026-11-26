@@ -469,6 +469,18 @@ fn validate_module_path(raw: &str, ecosystem: Ecosystem) -> Result<String, Strin
     Ok(normalized)
 }
 
+/// Extract a valid `PyPI` exact-match package candidate from a single- or multi-word search query
+/// (for example `"pytest fixtures"` → `Some("pytest")`).
+#[must_use]
+pub fn extract_pypi_candidate(raw_query: &str) -> Option<&str> {
+    let trimmed = raw_query.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let first_word = trimmed.split_whitespace().next()?;
+    validate_library_name(first_word, Ecosystem::Python).ok()
+}
+
 /// Build and validate an allowlisted upstream documentation URL.
 ///
 /// # Errors
@@ -1592,12 +1604,13 @@ impl FastDocsServer {
         encoded_query: &str,
     ) -> Result<Option<String>, String> {
         let exact_fut = async {
-            let Ok(exact_url) = build_url(raw_query, "latest", Ecosystem::Python) else {
+            let candidate = extract_pypi_candidate(raw_query)?;
+            let Ok(exact_url) = build_url(candidate, "latest", Ecosystem::Python) else {
                 return None;
             };
             let body = self.fetch_allowlisted(&exact_url).await.ok()?;
             let json = serde_json::from_str::<serde_json::Value>(&body).ok()?;
-            let name = json["info"]["name"].as_str().unwrap_or(raw_query);
+            let name = json["info"]["name"].as_str().unwrap_or(candidate);
             let ver = json["info"]["version"].as_str().unwrap_or("latest");
             let sum = json["info"]["summary"].as_str().unwrap_or("");
             Some(format!("- **{name}-{ver}** (python / PyPI exact): {sum}"))

@@ -1,10 +1,11 @@
 use std::fmt::Write as _;
 
 use fast_docs::tools::{
-    clamp_max_chars, detect_lang, html_to_context7, html_to_context7_with_options,
-    markdown_to_context7, markdown_to_context7_with_options, parse_pypi_json_to_context7,
-    resolve_go_module, slice_with_pagination, strip_html_tags, truncate_smart, urlencoding,
-    Ecosystem, MAX_ALLOWED_OUTPUT_CHARS, MAX_OUTPUT_CHARS, MIN_OUTPUT_CHARS,
+    clamp_max_chars, detect_lang, extract_pypi_candidate, html_to_context7,
+    html_to_context7_with_options, markdown_to_context7, markdown_to_context7_with_options,
+    parse_pypi_json_to_context7, resolve_go_module, slice_with_pagination, strip_html_tags,
+    truncate_smart, urlencoding, Ecosystem, MAX_ALLOWED_OUTPUT_CHARS, MAX_OUTPUT_CHARS,
+    MIN_OUTPUT_CHARS,
 };
 use proptest::prelude::*;
 
@@ -378,6 +379,18 @@ app.use('*', logger())
     );
     assert!(rendered.contains("app.use('/api/*', cors())"));
     assert!(!rendered.contains("Logger Middleware"));
+}
+
+#[test]
+fn extract_pypi_candidate_handles_single_and_multi_word_queries() {
+    assert_eq!(extract_pypi_candidate("pytest"), Some("pytest"));
+    assert_eq!(extract_pypi_candidate("pytest fixtures"), Some("pytest"));
+    assert_eq!(
+        extract_pypi_candidate("  pydantic   validators  "),
+        Some("pydantic")
+    );
+    assert_eq!(extract_pypi_candidate("../evil fixtures"), None);
+    assert_eq!(extract_pypi_candidate("   "), None);
 }
 
 proptest! {
