@@ -21,7 +21,7 @@ class FastDocs < Formula
   def install
     if OS.mac? && Hardware::CPU.arm?
       resource("tesseract").stage do
-        (libexec/"lib").install "lib/libtesseract.dylib"
+        (libexec/"lib").install Dir["lib/*.dylib"]
         (libexec/"tessdata").install Dir["tessdata/*.traineddata"]
       end
       ENV["FAST_DOCS_TESSERACT_LIB_DIR"] = (libexec/"lib").to_s
