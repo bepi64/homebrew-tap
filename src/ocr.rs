@@ -531,6 +531,19 @@ mod engine {
 #[cfg(fast_docs_ocr)]
 pub(crate) use engine::ocr_image_sections;
 
+/// Warm up the LSTM engine in a background thread when the native library is available.
+#[cfg(fast_docs_ocr)]
+pub fn warm_up_engine() {
+    unsafe extern "C" {
+        #[link_name = "TessBaseAPIWarmup"]
+        fn warm_up();
+    }
+    if (warm_up as usize) == 0 {
+        return;
+    }
+    std::thread::spawn(|| unsafe { warm_up() });
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;

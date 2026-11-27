@@ -6,3 +6,5 @@
 # cargo-mutants reports
 mutants.out/
 mutants.out.old/
+libexec/
+bin/

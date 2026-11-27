@@ -25,6 +25,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     prune_user_cache();
 
+    #[cfg(fast_docs_ocr)]
+    fast_docs::ocr::warm_up_engine();
+
     let args: Vec<String> = std::env::args().collect();
     let env_bind = std::env::var("FAST_DOCS_BIND").ok();
 

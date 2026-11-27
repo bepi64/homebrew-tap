@@ -32,6 +32,8 @@ fn main() -> Result<(), String> {
     println!("cargo:rustc-cfg=fast_docs_ocr");
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     println!("cargo:rustc-link-lib=dylib=tesseract");
+    println!("cargo:rustc-link-arg=-Wl,-weak_library,{}/libtesseract.2.dylib", lib_dir.display());
+    println!("cargo:rustc-link-arg=-Wl,-undefined,dynamic_lookup");
     // Homebrew layout: bin/fast-docs loads libexec/lib/libtesseract.dylib.
     println!("cargo:rustc-link-arg=-Wl,-rpath,@loader_path/../libexec/lib");
     // Development builds also need the build-machine directory; Homebrew builds must not leak it.

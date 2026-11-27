@@ -3,7 +3,7 @@ class FastDocs < Formula
   homepage "https://github.com/bepi64/homebrew-tap"
   url "https://github.com/bepi64/homebrew-tap/archive/refs/tags/v1.0.0.tar.gz"
   # Replace with the real archive SHA-256 once tag v1.0.0 is published on GitHub.
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  sha256 "956185d42882f8fcae9cc88bedcc49a0ab1fc806cb7f8604cc57f1371817f796"
   license "Apache-2.0"
 
   depends_on "rust" => :build
@@ -13,7 +13,7 @@ class FastDocs < Formula
       resource "tesseract" do
         url "https://github.com/bepi64/homebrew-tap/releases/download/tesseract-5.5.5/fast-docs-tesseract-5.5.5-aarch64-apple-darwin.tar.gz"
         # Replace with the real archive SHA-256 once tag tesseract-5.5.5 is published on GitHub.
-        sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+        sha256 "54b1b9c01f60d87f97d3bc4cbc66710d483153e5c28a5000570bed527429db29"
       end
     end
   end
@@ -21,7 +21,7 @@ class FastDocs < Formula
   def install
     if OS.mac? && Hardware::CPU.arm?
       resource("tesseract").stage do
-        (libexec/"lib").install "lib/libtesseract.dylib"
+        (libexec/"lib").install Dir["lib/*.dylib"]
         (libexec/"tessdata").install Dir["tessdata/*.traineddata"]
       end
       ENV["FAST_DOCS_TESSERACT_LIB_DIR"] = (libexec/"lib").to_s
