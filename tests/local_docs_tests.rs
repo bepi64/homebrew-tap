@@ -36,7 +36,7 @@ fn search_local_docs_indexes_markdown_ranks_by_topic_and_paginates() {
     )
     .is_ok());
 
-    let out = search_local_docs(&dir, Some("oidc jwt"), 2000, 0);
+    let out = search_local_docs(&dir, Some("oidc jwt"), 2000, 0, None);
     assert!(out.is_ok());
     if let Ok(text) = out {
         assert!(text.contains("TITLE: Authentication Flow"));
@@ -86,7 +86,7 @@ fn search_local_docs_excludes_secrets_ignored_dirs_and_escaping_symlinks() {
     assert!(fs::write(&outside_secret, "# Outside Secret\nESCAPED_SYMLINK_LEAK\n").is_ok());
     let _ = symlink(&outside_secret, dir.join("docs/escape.md"));
 
-    let out = search_local_docs(&dir, None, 10_000, 0);
+    let out = search_local_docs(&dir, None, 10_000, 0, None);
     assert!(out.is_ok());
     if let Ok(text) = out {
         assert!(text.contains("TITLE: Safe Guide"));
@@ -106,7 +106,7 @@ fn search_local_docs_excludes_secrets_ignored_dirs_and_escaping_symlinks() {
 #[test]
 fn search_local_docs_rejects_missing_directory() {
     let missing = unique_dir("missing");
-    assert!(search_local_docs(&missing, None, 2000, 0).is_err());
+    assert!(search_local_docs(&missing, None, 2000, 0, None).is_err());
 }
 
 #[test]
@@ -142,7 +142,7 @@ fn search_local_docs_prioritizes_readme_docs_indexes_paths_and_skips_templates()
     .is_ok());
 
     // 1. Without topic: README.md precedes CHANGELOG.md and .github templates are excluded
-    let overview = search_local_docs(&dir, None, 4000, 0);
+    let overview = search_local_docs(&dir, None, 4000, 0, None);
     assert!(overview.is_ok());
     if let Ok(text) = overview {
         assert!(!text.contains("Template noise"));
@@ -155,7 +155,7 @@ fn search_local_docs_prioritizes_readme_docs_indexes_paths_and_skips_templates()
     }
 
     // 2. Topic matching filename path finds docs/CONTRIBUTING.md
-    let contrib = search_local_docs(&dir, Some("CONTRIBUTING"), 2000, 0);
+    let contrib = search_local_docs(&dir, Some("CONTRIBUTING"), 2000, 0, None);
     assert!(contrib.is_ok());
     if let Ok(text) = contrib {
         assert!(
@@ -165,7 +165,7 @@ fn search_local_docs_prioritizes_readme_docs_indexes_paths_and_skips_templates()
     }
 
     // 3. Real docs rank ahead of CHANGELOG.md on topic queries
-    let timeouts = search_local_docs(&dir, Some("timeouts"), 4000, 0);
+    let timeouts = search_local_docs(&dir, Some("timeouts"), 4000, 0, None);
     assert!(timeouts.is_ok());
     if let Ok(text) = timeouts {
         let doc_pos = text.find("SOURCE: docs/timeouts.md");
@@ -176,5 +176,26 @@ fn search_local_docs_prioritizes_readme_docs_indexes_paths_and_skips_templates()
         }
     }
 
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(not(fast_docs_ocr))]
+#[test]
+fn search_local_docs_ignores_images_without_ocr_support() {
+    let dir = unique_dir("no-ocr");
+    assert!(fs::create_dir_all(&dir).is_ok());
+    assert!(fs::write(dir.join("README.md"), "# Overview\nPlain text docs.\n").is_ok());
+    assert!(fs::write(
+        dir.join("diagram.png"),
+        b"\x89PNG\r\n\x1a\nnot a real image"
+    )
+    .is_ok());
+
+    let out = search_local_docs(&dir, None, 4000, 0, None);
+    assert!(out.is_ok());
+    if let Ok(text) = out {
+        assert!(text.contains("Overview"));
+        assert!(!text.contains("diagram.png"));
+    }
     let _ = fs::remove_dir_all(&dir);
 }

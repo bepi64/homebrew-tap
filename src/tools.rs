@@ -1,5 +1,5 @@
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use reqwest::redirect::Policy;
@@ -2891,7 +2891,7 @@ impl FastDocsServer {
 
     #[tool(
         name = "fetch_local_docs",
-        description = "Search and read local documentation inside a private repository or directory: Markdown/text (.md, .mdx, .txt, .rst), Jupyter notebooks (.ipynb), Office/OpenDocument (.docx, .pptx, .xlsx, .odt, .odp, .ods), EPUB (.epub), and PDF (.pdf). Enforces anti-zip-bomb, anti-XXE, secret-exclusion, and anti-symlink-escape guards with topic ranking and pagination."
+        description = "Search and read local documentation inside a private repository or directory: Markdown/text (.md, .mdx, .txt, .rst), Jupyter notebooks (.ipynb), Office/OpenDocument (.docx, .pptx, .xlsx, .odt, .odp, .ods), EPUB (.epub), PDF (.pdf), and images (.png, .jpg, .jpeg, .webp, .tif, .tiff, .gif) through on-device Tesseract OCR when built with OCR support. Enforces anti-zip-bomb, anti-XXE, image-size, secret-exclusion, and anti-symlink-escape guards with topic ranking and pagination."
     )]
     async fn fetch_local_docs(
         &self,
@@ -2908,12 +2908,17 @@ impl FastDocsServer {
         let max_chars = clamp_max_chars(req.max_chars);
         let offset = req.offset.unwrap_or(0);
 
-        match search_local_docs(
-            Path::new(trimmed_dir),
-            req.topic.as_deref(),
-            max_chars,
-            offset,
-        ) {
+        // The scan does blocking file I/O and OCR; keep it off the shared daemon's async workers.
+        let root = PathBuf::from(trimmed_dir);
+        let topic = req.topic.clone();
+        let cache = self.cache.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            search_local_docs(&root, topic.as_deref(), max_chars, offset, cache.as_ref())
+        })
+        .await
+        .unwrap_or_else(|err| Err(format!("local documentation task failed: {err}")));
+
+        match result {
             Ok(rendered) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "# Local Docs ({trimmed_dir})\n\n{rendered}"
             ))])),

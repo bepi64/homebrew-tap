@@ -478,7 +478,6 @@ mod engine {
     }
 
     /// OCR every image (already capped and priority-sorted by the caller) into doc sections.
-    #[expect(dead_code, reason = "wired into search_local_docs in the next commit")]
     pub(crate) fn ocr_image_sections(
         images: &[PathBuf],
         root: &Path,
@@ -525,10 +524,6 @@ mod engine {
 }
 
 #[cfg(fast_docs_ocr)]
-#[expect(
-    unused_imports,
-    reason = "wired into search_local_docs in the next commit"
-)]
 pub(crate) use engine::ocr_image_sections;
 
 #[cfg(test)]

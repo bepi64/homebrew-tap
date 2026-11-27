@@ -177,7 +177,7 @@ fn extracts_ipynb_docx_pptx_xlsx_odt_epub_and_pdf_cleanly() {
     }
 
     // End-to-end search_local_docs finds rich Office formats by topic
-    let found = search_local_docs(&dir, Some("Zero Trust"), 2000, 0);
+    let found = search_local_docs(&dir, Some("Zero Trust"), 2000, 0, None);
     assert!(found.is_ok());
     if let Ok(text) = found {
         assert!(text.contains("SOURCE: spec.docx"));
