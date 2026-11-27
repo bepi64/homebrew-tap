@@ -26,13 +26,17 @@ schemars = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
+# Safe-Rust image decoding for OCR; only linked where `build.rs` enables `cfg(fast_docs_ocr)`.
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+image = { version = "0.25.10", optional = true, default-features = false, features = ["png", "jpeg", "webp", "tiff", "gif"] }
+
 [dev-dependencies]
 proptest = "1.12.0"
 tokio = { version = "1", features = ["net"] }
 
 [features]
 # Tesseract OCR for local images. Only takes effect on macOS Apple Silicon (see build.rs).
-ocr = []
+ocr = ["dep:image"]
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }

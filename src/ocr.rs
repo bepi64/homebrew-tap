@@ -198,13 +198,56 @@ pub fn health_json() -> String {
 
 #[cfg(fast_docs_ocr)]
 mod engine {
-    use std::ffi::CStr;
+    use std::ffi::{c_char, c_int, CStr, CString};
+    use std::fs;
+    use std::io::Cursor;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::path::{Path, PathBuf};
+    use std::ptr::NonNull;
+    use std::sync::Once;
+
+    use image::{GrayImage, ImageReader, Limits};
+
+    use super::{
+        bound_ocr_text, check_dimensions, default_tessdata_dir, ocr_cache_key, passes_confidence,
+        validate_lang, DimensionCheck, DEFAULT_OCR_LANG, MAX_OCR_DECODE_ALLOC_BYTES,
+        MAX_OCR_SIDE_PX, OCR_SOURCE_DPI,
+    };
+    use crate::cache::DiskCache;
+    use crate::extractors::{lines_to_sections, MAX_RICH_DOC_FILE_BYTES};
+    use crate::tools::DocSection;
 
     mod ffi {
-        use std::ffi::c_char;
+        use std::ffi::{c_char, c_int};
+
+        /// Opaque `TessBaseAPI` handle from Tesseract's C API (`tesseract/capi.h`).
+        #[repr(C)]
+        pub struct TessBaseAPI {
+            _private: [u8; 0],
+        }
 
         unsafe extern "C" {
             pub fn TessVersion() -> *const c_char;
+            pub fn TessBaseAPICreate() -> *mut TessBaseAPI;
+            pub fn TessBaseAPIInit3(
+                handle: *mut TessBaseAPI,
+                datapath: *const c_char,
+                language: *const c_char,
+            ) -> c_int;
+            pub fn TessBaseAPISetImage(
+                handle: *mut TessBaseAPI,
+                imagedata: *const u8,
+                width: c_int,
+                height: c_int,
+                bytes_per_pixel: c_int,
+                bytes_per_line: c_int,
+            );
+            pub fn TessBaseAPISetSourceResolution(handle: *mut TessBaseAPI, ppi: c_int);
+            pub fn TessBaseAPIGetUTF8Text(handle: *mut TessBaseAPI) -> *mut c_char;
+            pub fn TessBaseAPIMeanTextConf(handle: *mut TessBaseAPI) -> c_int;
+            pub fn TessDeleteText(text: *const c_char);
+            pub fn TessBaseAPIEnd(handle: *mut TessBaseAPI);
+            pub fn TessBaseAPIDelete(handle: *mut TessBaseAPI);
         }
     }
 
@@ -221,7 +264,272 @@ mod engine {
         let version = unsafe { CStr::from_ptr(raw) };
         Some(version.to_string_lossy().into_owned())
     }
+
+    /// Owned, initialized Tesseract handle. Not `Send`/`Sync` (`NonNull`), so each scan owns one.
+    pub(super) struct TessHandle(NonNull<ffi::TessBaseAPI>);
+
+    impl TessHandle {
+        /// Create a handle and load `<tessdata>/<lang>.traineddata`.
+        pub(super) fn new(tessdata: &Path, lang: &str) -> Result<Self, String> {
+            validate_lang(lang)?;
+            let datapath = CString::new(tessdata.as_os_str().as_bytes())
+                .map_err(|_| "Tesseract data path contains a NUL byte".to_string())?;
+            let language = CString::new(lang)
+                .map_err(|_| "Tesseract language contains a NUL byte".to_string())?;
+
+            // SAFETY: `TessBaseAPICreate` has no preconditions and returns an owned handle or null.
+            let raw = unsafe { ffi::TessBaseAPICreate() };
+            let handle = NonNull::new(raw)
+                .map(Self)
+                .ok_or_else(|| "TessBaseAPICreate returned null".to_string())?;
+
+            // SAFETY: `handle.0` is the live handle created above. `datapath` and `language` are
+            // NUL-terminated and outlive the call; Tesseract copies them during initialization.
+            let rc = unsafe {
+                ffi::TessBaseAPIInit3(handle.0.as_ptr(), datapath.as_ptr(), language.as_ptr())
+            };
+            if rc != 0 {
+                return Err(format!(
+                    "Tesseract could not load language '{lang}' from {} (code {rc})",
+                    tessdata.display()
+                ));
+            }
+            Ok(handle)
+        }
+
+        /// Recognize an 8-bit grayscale image, returning the text and its mean word confidence.
+        pub(super) fn recognize(&mut self, image: &GrayImage) -> Result<(String, i32), String> {
+            let width = c_int::try_from(image.width())
+                .map_err(|_| "image width exceeds the C int range".to_string())?;
+            let height = c_int::try_from(image.height())
+                .map_err(|_| "image height exceeds the C int range".to_string())?;
+            let pixels = image.as_raw();
+
+            // SAFETY: `self.0` is a live, initialized handle (invariant of `TessHandle`). `pixels`
+            // holds exactly `width * height` bytes (1 byte per pixel, rows of `width` bytes) and
+            // stays borrowed for this whole function. Tesseract copies the buffer into its own
+            // image (`baseapi.h`: "Copies the image buffer").
+            unsafe {
+                ffi::TessBaseAPISetImage(self.0.as_ptr(), pixels.as_ptr(), width, height, 1, width);
+            }
+            // SAFETY: same live handle; setting the resolution has no other precondition.
+            unsafe { ffi::TessBaseAPISetSourceResolution(self.0.as_ptr(), OCR_SOURCE_DPI) };
+            // SAFETY: live handle with an image set. Returns null or a NUL-terminated string owned
+            // by the caller, released by `TessText::drop` through `TessDeleteText`.
+            let raw = unsafe { ffi::TessBaseAPIGetUTF8Text(self.0.as_ptr()) };
+            let text = match NonNull::new(raw) {
+                Some(ptr) => TessText(ptr).to_string_lossy(),
+                None => String::new(),
+            };
+            // SAFETY: live handle; recognition already ran during `TessBaseAPIGetUTF8Text`.
+            let confidence = unsafe { ffi::TessBaseAPIMeanTextConf(self.0.as_ptr()) };
+            Ok((text, confidence))
+        }
+    }
+
+    impl Drop for TessHandle {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` was returned by `TessBaseAPICreate` and is released exactly once
+            // here. `TessBaseAPIEnd` is valid even when `TessBaseAPIInit3` failed.
+            unsafe {
+                ffi::TessBaseAPIEnd(self.0.as_ptr());
+                ffi::TessBaseAPIDelete(self.0.as_ptr());
+            }
+        }
+    }
+
+    /// Text returned by `TessBaseAPIGetUTF8Text`, released with `TessDeleteText` on drop.
+    struct TessText(NonNull<c_char>);
+
+    impl TessText {
+        fn to_string_lossy(&self) -> String {
+            // SAFETY: `self.0` is a non-null, NUL-terminated string allocated by Tesseract and
+            // valid until `TessDeleteText` runs in `drop`.
+            let text = unsafe { CStr::from_ptr(self.0.as_ptr()) };
+            text.to_string_lossy().into_owned()
+        }
+    }
+
+    impl Drop for TessText {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` came from `TessBaseAPIGetUTF8Text` and is released exactly once.
+            unsafe { ffi::TessDeleteText(self.0.as_ptr()) };
+        }
+    }
+
+    /// Lazily created engine for one scan: created on the first image that misses the cache.
+    enum EngineState {
+        Uninitialized,
+        Ready(TessHandle),
+        Unavailable,
+    }
+
+    impl EngineState {
+        fn ready(
+            &mut self,
+            tessdata: Option<&Path>,
+            lang: &str,
+        ) -> Result<&mut TessHandle, String> {
+            if let Self::Uninitialized = self {
+                *self = match open_engine(tessdata, lang) {
+                    Ok(handle) => Self::Ready(handle),
+                    Err(err) => {
+                        warn_engine_unavailable(&err);
+                        Self::Unavailable
+                    }
+                };
+            }
+            match self {
+                Self::Ready(handle) => Ok(handle),
+                Self::Unavailable | Self::Uninitialized => {
+                    Err("Tesseract OCR engine is unavailable".to_string())
+                }
+            }
+        }
+    }
+
+    fn open_engine(tessdata: Option<&Path>, lang: &str) -> Result<TessHandle, String> {
+        let dir = tessdata.ok_or_else(|| {
+            "no Tesseract language data directory found (set FAST_DOCS_TESSDATA_DIR)".to_string()
+        })?;
+        TessHandle::new(dir, lang)
+    }
+
+    static ENGINE_WARNING: Once = Once::new();
+
+    fn warn_engine_unavailable(err: &str) {
+        ENGINE_WARNING.call_once(|| {
+            tracing::warn!("OCR disabled for images in this process: {err}");
+        });
+    }
+
+    /// Decode an image in safe Rust after checking its header dimensions.
+    ///
+    /// Returns `Ok(None)` for images too small to hold text.
+    pub(super) fn decode_gray(bytes: &[u8]) -> Result<Option<GrayImage>, String> {
+        let header = ImageReader::new(Cursor::new(bytes))
+            .with_guessed_format()
+            .map_err(|err| format!("failed to read image header: {err}"))?;
+        let (width, height) = header
+            .into_dimensions()
+            .map_err(|err| format!("unsupported or corrupt image: {err}"))?;
+        match check_dimensions(width, height) {
+            DimensionCheck::Accept => {}
+            DimensionCheck::TooSmall => return Ok(None),
+            DimensionCheck::TooLarge => {
+                return Err(format!("image {width}x{height} exceeds OCR size bounds"));
+            }
+        }
+
+        let mut reader = ImageReader::new(Cursor::new(bytes))
+            .with_guessed_format()
+            .map_err(|err| format!("failed to read image header: {err}"))?;
+        let mut limits = Limits::default();
+        limits.max_image_width = Some(MAX_OCR_SIDE_PX);
+        limits.max_image_height = Some(MAX_OCR_SIDE_PX);
+        limits.max_alloc = Some(MAX_OCR_DECODE_ALLOC_BYTES);
+        reader.limits(limits);
+        let image = reader
+            .decode()
+            .map_err(|err| format!("failed to decode image: {err}"))?;
+        Ok(Some(image.into_luma8()))
+    }
+
+    fn non_empty(text: String) -> Option<String> {
+        (!text.is_empty()).then_some(text)
+    }
+
+    fn ocr_image_text(
+        path: &Path,
+        cache: Option<&DiskCache>,
+        version: &str,
+        lang: &str,
+        tessdata: Option<&Path>,
+        engine: &mut EngineState,
+    ) -> Result<Option<String>, String> {
+        let bytes = fs::read(path).map_err(|err| format!("failed to read image: {err}"))?;
+        if bytes.len() as u64 > MAX_RICH_DOC_FILE_BYTES {
+            return Err(format!("image exceeds {MAX_RICH_DOC_FILE_BYTES} bytes"));
+        }
+
+        let key = ocr_cache_key(&bytes, lang, version);
+        if let Some(cached) = cache.and_then(|cache| cache.get(&key, true)) {
+            return Ok(non_empty(cached));
+        }
+
+        let handle = engine.ready(tessdata, lang)?;
+        let Some(image) = decode_gray(&bytes)? else {
+            return Ok(None);
+        };
+        let (raw_text, confidence) = handle.recognize(&image)?;
+        let text = if passes_confidence(confidence) {
+            bound_ocr_text(raw_text.trim())
+        } else {
+            String::new()
+        };
+
+        // Empty results are cached too, so filtered images are not re-processed.
+        if let Some(cache) = cache {
+            if let Err(err) = cache.put(&key, &text, true) {
+                tracing::debug!("failed to cache OCR result: {err}");
+            }
+        }
+        Ok(non_empty(text))
+    }
+
+    /// OCR every image (already capped and priority-sorted by the caller) into doc sections.
+    #[expect(dead_code, reason = "wired into search_local_docs in the next commit")]
+    pub(crate) fn ocr_image_sections(
+        images: &[PathBuf],
+        root: &Path,
+        cache: Option<&DiskCache>,
+    ) -> Vec<DocSection> {
+        ocr_image_sections_with(
+            images,
+            root,
+            cache,
+            default_tessdata_dir().as_deref(),
+            DEFAULT_OCR_LANG,
+        )
+    }
+
+    pub(super) fn ocr_image_sections_with(
+        images: &[PathBuf],
+        root: &Path,
+        cache: Option<&DiskCache>,
+        tessdata: Option<&Path>,
+        lang: &str,
+    ) -> Vec<DocSection> {
+        let mut sections = Vec::new();
+        if images.is_empty() {
+            return sections;
+        }
+        let version = tesseract_version().unwrap_or_default();
+        let mut engine = EngineState::Uninitialized;
+        for path in images {
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(path)
+                .display()
+                .to_string();
+            match ocr_image_text(path, cache, &version, lang, tessdata, &mut engine) {
+                Ok(Some(text)) => {
+                    sections.extend(lines_to_sections(&text, &format!("{rel} (OCR)"), &rel));
+                }
+                Ok(None) => {}
+                Err(err) => tracing::debug!("skipping image '{rel}' for OCR: {err}"),
+            }
+        }
+        sections
+    }
 }
+
+#[cfg(fast_docs_ocr)]
+#[expect(
+    unused_imports,
+    reason = "wired into search_local_docs in the next commit"
+)]
+pub(crate) use engine::ocr_image_sections;
 
 #[cfg(test)]
 mod tests {
@@ -370,5 +678,154 @@ mod tests {
         assert!(!is_ocr_image_file(Path::new("diagram.svg")));
         assert!(!is_ocr_image_file(Path::new("README.md")));
         assert!(!is_ocr_image_file(Path::new("png")));
+    }
+}
+
+#[cfg(all(test, fast_docs_ocr))]
+mod engine_tests {
+    use std::fs;
+    use std::io::Cursor;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use image::{GrayImage, ImageFormat, Luma};
+
+    use super::engine::{decode_gray, ocr_image_sections_with, TessHandle};
+    use super::{default_tessdata_dir, tesseract_version, DEFAULT_OCR_LANG, DEV_TESSDATA_DIR};
+    use crate::cache::DiskCache;
+
+    fn fixture_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ocr")
+    }
+
+    fn unique_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        std::env::temp_dir().join(format!(
+            "fast-docs-ocr-engine-{label}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    fn encoded_gray_png(width: u32, height: u32, value: u8) -> Vec<u8> {
+        let mut out = Cursor::new(Vec::new());
+        let written = GrayImage::from_pixel(width, height, Luma([value]))
+            .write_to(&mut out, ImageFormat::Png);
+        assert!(written.is_ok());
+        out.into_inner()
+    }
+
+    #[test]
+    fn tesseract_version_reports_major_five() {
+        let version = tesseract_version();
+        assert!(
+            version.as_deref().is_some_and(|v| v.starts_with("5.")),
+            "{version:?}"
+        );
+    }
+
+    #[test]
+    fn tess_handle_rejects_missing_language_data() {
+        let empty = unique_dir("empty-tessdata");
+        assert!(fs::create_dir_all(&empty).is_ok());
+        assert!(TessHandle::new(&empty, DEFAULT_OCR_LANG).is_err());
+        let _ = fs::remove_dir_all(&empty);
+    }
+
+    #[test]
+    fn tess_handle_rejects_invalid_language() {
+        assert!(TessHandle::new(Path::new(DEV_TESSDATA_DIR), "../eng").is_err());
+    }
+
+    #[test]
+    fn decode_gray_accepts_text_fixture_and_skips_icons() {
+        let fixture = fs::read(fixture_dir().join("ledger.png"));
+        assert!(fixture.is_ok());
+        if let Ok(bytes) = fixture {
+            let decoded = decode_gray(&bytes);
+            assert!(
+                matches!(decoded, Ok(Some(ref image)) if image.width() == 1200 && image.height() == 120)
+            );
+        }
+        assert!(matches!(
+            decode_gray(&encoded_gray_png(16, 16, 0)),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn decode_gray_rejects_oversized_and_garbage_input() {
+        assert!(decode_gray(&encoded_gray_png(8193, 32, 255)).is_err());
+        assert!(decode_gray(b"definitely not an image").is_err());
+    }
+
+    #[test]
+    fn ocr_image_sections_reads_fixture_text() {
+        let root = fixture_dir();
+        let sections = ocr_image_sections_with(
+            &[root.join("ledger.png")],
+            &root,
+            None,
+            default_tessdata_dir().as_deref(),
+            DEFAULT_OCR_LANG,
+        );
+        assert_eq!(sections.len(), 1);
+        if let Some(section) = sections.first() {
+            assert_eq!(section.title, "ledger.png (OCR)");
+            assert_eq!(section.source.as_deref(), Some("ledger.png"));
+            assert!(section
+                .descriptions
+                .join(" ")
+                .contains("Quantum Ledger Reconciliation"));
+        }
+    }
+
+    #[test]
+    fn ocr_image_sections_skip_everything_without_language_data() {
+        let empty = unique_dir("no-tessdata");
+        assert!(fs::create_dir_all(&empty).is_ok());
+        let root = fixture_dir();
+        let sections = ocr_image_sections_with(
+            &[root.join("ledger.png")],
+            &root,
+            None,
+            Some(&empty),
+            DEFAULT_OCR_LANG,
+        );
+        assert!(sections.is_empty());
+        let _ = fs::remove_dir_all(&empty);
+    }
+
+    #[test]
+    fn ocr_image_sections_skip_missing_files() {
+        let root = fixture_dir();
+        let sections = ocr_image_sections_with(
+            &[root.join("does-not-exist.png")],
+            &root,
+            None,
+            default_tessdata_dir().as_deref(),
+            DEFAULT_OCR_LANG,
+        );
+        assert!(sections.is_empty());
+    }
+
+    #[test]
+    fn ocr_image_sections_keep_results_when_cache_write_fails() {
+        let root = fixture_dir();
+        // A cache rooted under a regular file can neither be read nor written.
+        let cache = DiskCache::new(
+            root.join("ledger.png").join("cache"),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+        let sections = ocr_image_sections_with(
+            &[root.join("ledger.png")],
+            &root,
+            Some(&cache),
+            default_tessdata_dir().as_deref(),
+            DEFAULT_OCR_LANG,
+        );
+        assert_eq!(sections.len(), 1);
     }
 }

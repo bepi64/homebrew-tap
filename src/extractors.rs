@@ -183,7 +183,11 @@ fn read_zip_entry_bounded(
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
-fn lines_to_sections(text: &str, default_title: &str, rel_path: &str) -> Vec<DocSection> {
+pub(crate) fn lines_to_sections(
+    text: &str,
+    default_title: &str,
+    rel_path: &str,
+) -> Vec<DocSection> {
     let mut descriptions = Vec::new();
     for line in text.lines() {
         let trimmed = line.trim();
