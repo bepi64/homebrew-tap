@@ -30,6 +30,10 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 proptest = "1.12.0"
 tokio = { version = "1", features = ["net"] }
 
+[features]
+# Tesseract OCR for local images. Only takes effect on macOS Apple Silicon (see build.rs).
+ocr = []
+
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 # Panic prevention

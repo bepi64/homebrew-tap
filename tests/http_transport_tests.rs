@@ -86,6 +86,13 @@ async fn streamable_http_server_handles_initialize_health_404_and_dns_rebinding(
             "unexpected health: {text}"
         );
         assert!(text.contains("fast-docs"));
+        #[cfg(not(fast_docs_ocr))]
+        assert!(text.contains("\"ocr\":null"), "unexpected health: {text}");
+        #[cfg(fast_docs_ocr)]
+        assert!(
+            text.contains("\"engine\":\"tesseract\""),
+            "unexpected health: {text}"
+        );
     }
 
     // 2. Unknown route returns 404 Not Found

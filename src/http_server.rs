@@ -140,8 +140,9 @@ pub async fn spawn_streamable_http_server(
                                 let path = req.uri().path();
                                 if path == "/health" && req.method() == Method::GET {
                                     let payload = format!(
-                                        r#"{{"status":"ok","service":"fast-docs","version":"{}"}}"#,
-                                        env!("CARGO_PKG_VERSION")
+                                        r#"{{"status":"ok","service":"fast-docs","version":"{}","ocr":{}}}"#,
+                                        env!("CARGO_PKG_VERSION"),
+                                        crate::ocr::health_json()
                                     );
                                     return Ok::<_, Infallible>(json_response(StatusCode::OK, &payload));
                                 }
