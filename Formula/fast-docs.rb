@@ -8,8 +8,28 @@ class FastDocs < Formula
 
   depends_on "rust" => :build
 
+  on_macos do
+    on_arm do
+      resource "tesseract" do
+        url "https://github.com/bepi64/homebrew-tap/releases/download/tesseract-5.5.5/fast-docs-tesseract-5.5.5-aarch64-apple-darwin.tar.gz"
+        # Replace with the real archive SHA-256 once tag tesseract-5.5.5 is published on GitHub.
+        sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+      end
+    end
+  end
+
   def install
-    system "cargo", "install", *std_cargo_args
+    if OS.mac? && Hardware::CPU.arm?
+      resource("tesseract").stage do
+        (libexec/"lib").install "lib/libtesseract.dylib"
+        (libexec/"tessdata").install Dir["tessdata/*.traineddata"]
+      end
+      ENV["FAST_DOCS_TESSERACT_LIB_DIR"] = (libexec/"lib").to_s
+      ENV["FAST_DOCS_PORTABLE_RPATH"] = "1"
+      system "cargo", "install", "--features", "ocr", *std_cargo_args
+    else
+      system "cargo", "install", *std_cargo_args
+    end
   end
 
   service do
@@ -37,5 +57,19 @@ class FastDocs < Formula
 
     output = pipe_output("#{bin}/fast-docs --stdio", "#{init_req}\n#{initialized_note}\n", 0)
     assert_match "fast-docs", output
+
+    if OS.mac? && Hardware::CPU.arm?
+      port = free_port
+      pid = spawn bin/"fast-docs", "--http", "127.0.0.1:#{port}"
+      begin
+        sleep 2
+        health = shell_output("curl -s http://127.0.0.1:#{port}/health")
+        assert_match '"engine":"tesseract"', health
+        assert_match '"tessdata":"ok"', health
+      ensure
+        Process.kill("TERM", pid)
+        Process.wait(pid)
+      end
+    end
   end
 end
