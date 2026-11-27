@@ -39,6 +39,34 @@ jobs:
       - name: Build binary
         run: cargo build --locked
 
+  rust-ocr:
+    name: Rust OCR (macOS arm64, clippy, test)
+    runs-on: macos-15
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          components: clippy
+
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Install Tesseract
+        run: brew install tesseract
+
+      - name: Run Clippy with OCR
+        run: cargo clippy --all-targets --features ocr -- -D warnings
+
+      - name: Run tests with OCR
+        run: cargo test --locked --features ocr
+
   deny:
     name: Supply chain (cargo-deny)
     runs-on: ubuntu-latest
