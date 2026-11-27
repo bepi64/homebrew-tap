@@ -3,7 +3,7 @@ class FastDocs < Formula
   homepage "https://github.com/bepi64/homebrew-tap"
   url "https://github.com/bepi64/homebrew-tap/archive/refs/tags/v1.0.0.tar.gz"
   # Replace with the real archive SHA-256 once tag v1.0.0 is published on GitHub.
-  sha256 "956185d42882f8fcae9cc88bedcc49a0ab1fc806cb7f8604cc57f1371817f796"
+  sha256 "fa6e34d9e11b2120fd00a4f2262a033d0544b8ad01657452019e25142fa9a1f1"
   license "Apache-2.0"
 
   depends_on "rust" => :build
