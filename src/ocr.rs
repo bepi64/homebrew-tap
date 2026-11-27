@@ -4,6 +4,7 @@
 //! `fast_docs_ocr` cfg that `build.rs` emits. All `unsafe` code of the crate lives in this module.
 
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -141,15 +142,19 @@ pub fn resolve_tessdata_dir(
     dev_fallback.is_dir().then(|| dev_fallback.to_path_buf())
 }
 
+/// Interpret a raw `FAST_DOCS_TESSDATA_DIR` value: unset or empty means no override.
+#[must_use]
+pub fn tessdata_override(raw: Option<OsString>) -> Option<PathBuf> {
+    raw.filter(|value| !value.is_empty()).map(PathBuf::from)
+}
+
 /// Resolve the language data directory from `FAST_DOCS_TESSDATA_DIR` and the running executable.
 ///
 /// The executable path is canonicalized because Homebrew launches `fast-docs` through the
 /// `/opt/homebrew/bin` symlink, and only the resolved Cellar path has a sibling `libexec/`.
 #[must_use]
 pub fn default_tessdata_dir() -> Option<PathBuf> {
-    let env_override = env::var_os("FAST_DOCS_TESSDATA_DIR")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from);
+    let env_override = tessdata_override(env::var_os("FAST_DOCS_TESSDATA_DIR"));
     let exe_path = env::current_exe()
         .ok()
         .and_then(|exe| fs::canonicalize(exe).ok());
@@ -532,9 +537,11 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use std::ffi::OsString;
+
     use super::{
         bound_ocr_text, check_dimensions, is_ocr_image_file, ocr_cache_key, passes_confidence,
-        resolve_tessdata_dir, validate_lang, DimensionCheck, OCR_ENABLED,
+        resolve_tessdata_dir, tessdata_override, validate_lang, DimensionCheck, OCR_ENABLED,
     };
     use crate::extractors::MAX_EXTRACTED_BYTES;
 
@@ -596,6 +603,22 @@ mod tests {
     }
 
     #[test]
+    fn tessdata_override_ignores_unset_and_empty_values() {
+        assert_eq!(tessdata_override(None), None);
+        assert_eq!(tessdata_override(Some(OsString::new())), None);
+        assert_eq!(
+            tessdata_override(Some(OsString::from("/custom/tessdata"))),
+            Some(PathBuf::from("/custom/tessdata"))
+        );
+    }
+
+    #[cfg(not(fast_docs_ocr))]
+    #[test]
+    fn tesseract_version_is_none_without_ocr() {
+        assert_eq!(super::tesseract_version(), None);
+    }
+
+    #[test]
     fn validate_lang_accepts_tesseract_codes_and_combinations() {
         for lang in ["eng", "chi_sim", "eng+fra", "deu+eng+chi_tra"] {
             assert!(validate_lang(lang).is_ok(), "{lang} should be accepted");
@@ -623,6 +646,7 @@ mod tests {
     fn check_dimensions_enforces_exact_bounds() {
         assert_eq!(check_dimensions(32, 32), DimensionCheck::Accept);
         assert_eq!(check_dimensions(8192, 2048), DimensionCheck::Accept);
+        assert_eq!(check_dimensions(2048, 8192), DimensionCheck::Accept);
         assert_eq!(check_dimensions(4096, 4096), DimensionCheck::Accept);
         assert_eq!(check_dimensions(31, 500), DimensionCheck::TooSmall);
         assert_eq!(check_dimensions(500, 31), DimensionCheck::TooSmall);
@@ -683,11 +707,12 @@ mod engine_tests {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use image::{GrayImage, ImageFormat, Luma};
+    use image::{GrayImage, ImageFormat, Luma, Rgba, RgbaImage};
 
     use super::engine::{decode_gray, ocr_image_sections_with, TessHandle};
     use super::{default_tessdata_dir, tesseract_version, DEFAULT_OCR_LANG, DEV_TESSDATA_DIR};
     use crate::cache::DiskCache;
+    use crate::extractors::MAX_RICH_DOC_FILE_BYTES;
 
     fn fixture_dir() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ocr")
@@ -747,6 +772,69 @@ mod engine_tests {
             decode_gray(&encoded_gray_png(16, 16, 0)),
             Ok(None)
         ));
+    }
+
+    #[test]
+    fn decode_gray_accepts_rgba_at_the_maximum_pixel_count() {
+        // 4096 x 4096 RGBA8 needs exactly MAX_OCR_DECODE_ALLOC_BYTES (64 MiB) to decode.
+        let mut out = Cursor::new(Vec::new());
+        let written = RgbaImage::from_pixel(4096, 4096, Rgba([255, 255, 255, 255]))
+            .write_to(&mut out, ImageFormat::Png);
+        assert!(written.is_ok());
+        let decoded = decode_gray(&out.into_inner());
+        assert!(
+            matches!(decoded, Ok(Some(ref image)) if image.width() == 4096 && image.height() == 4096),
+            "{:?}",
+            decoded.map(|image| image.map(|i| i.dimensions()))
+        );
+    }
+
+    #[test]
+    fn default_tessdata_dir_finds_english_language_data() {
+        let dir = default_tessdata_dir();
+        assert!(
+            dir.as_deref()
+                .is_some_and(|d| d.join("eng.traineddata").is_file()),
+            "{dir:?}"
+        );
+    }
+
+    #[test]
+    fn ocr_image_sections_enforce_the_file_size_cap() {
+        let fixture = fs::read(fixture_dir().join("ledger.png"));
+        assert!(fixture.is_ok());
+        let Ok(png) = fixture else {
+            return;
+        };
+        let dir = unique_dir("size-cap");
+        assert!(fs::create_dir_all(&dir).is_ok());
+        let Ok(cap) = usize::try_from(MAX_RICH_DOC_FILE_BYTES) else {
+            return;
+        };
+        // PNG decoders ignore bytes after IEND, so padding keeps the image readable.
+        for (name, size) in [("at-cap.png", cap), ("over-cap.png", cap + 1)] {
+            let mut padded = png.clone();
+            padded.resize(size, 0);
+            assert!(fs::write(dir.join(name), &padded).is_ok());
+        }
+        let tessdata = default_tessdata_dir();
+        let at_cap = ocr_image_sections_with(
+            &[dir.join("at-cap.png")],
+            &dir,
+            None,
+            tessdata.as_deref(),
+            DEFAULT_OCR_LANG,
+        );
+        let over_cap = ocr_image_sections_with(
+            &[dir.join("over-cap.png")],
+            &dir,
+            None,
+            tessdata.as_deref(),
+            DEFAULT_OCR_LANG,
+        );
+        assert_eq!(at_cap.len(), 1);
+        assert!(over_cap.is_empty());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

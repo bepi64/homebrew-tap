@@ -23,9 +23,11 @@ Development milestones and tasks for `fast-docs` (`homebrew-tap`).
 - [x] Pure-Rust rich document extraction for `fetch_local_docs` across `.md`, `.rst`, `.ipynb`, `.docx`, `.pptx`, `.xlsx`, `.odt`, `.odp`, `.ods`, `.epub`, and `.pdf` with anti-zip-bomb, anti-XXE, and secret exclusions.
 - [x] Cache observability and maintenance MCP tool (`manage_cache` with `stats`, `prune`, `clear`).
 - [x] Daemon-first shared background architecture (`127.0.0.1:3000/mcp`, `GET /health`, `brew services`, `--stdio`).
+- [x] On-device Tesseract OCR for repository images in `fetch_local_docs` on Apple Silicon (`--features ocr`, native-linked `libtesseract.dylib`, content-hash cache, `spawn_blocking` scan).
 
 ## Milestone 4: CI/CD & Homebrew Tap Distribution
 - [x] Configure GitHub Actions CI (`.github/workflows/ci.yml`) and release automation (`.github/workflows/release.yml`) with SHA-pinned actions, verified locally with `actionlint` and `zizmor`.
 - [x] Add `.github/dependabot.yml` with 7-day cooldowns and grouped updates for `cargo` and `github-actions`.
 - [x] Author `Formula/fast-docs.rb` with Homebrew `service do` definition, `test do` block, and bump crate version to `1.0.0`.
 - [ ] Push to GitHub, publish `v1.0.0` release tag, update formula `sha256`, and validate with `brew audit --strict --new`, `brew install --build-from-source`, and `brew test`.
+- [ ] Publish the `tesseract-5.5.5` release asset, set the `tesseract` resource `sha256` in `Formula/fast-docs.rb`, and validate with `brew install --build-from-source` and `brew test` (Q-OCR-1).

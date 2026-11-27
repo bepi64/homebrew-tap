@@ -3,11 +3,11 @@
 **A local-first, sub-millisecond MCP documentation server for AI coding assistants — written in pure safe Rust.**
 
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Rust: 100% Safe](https://img.shields.io/badge/unsafe-0%20blocks-brightgreen.svg)](#security-by-design--verified-by-tests)
-[![Tests: 81 Passing](https://img.shields.io/badge/tests-81%20passing-brightgreen.svg)](#security-by-design--verified-by-tests)
+[![Rust: unsafe confined to FFI](https://img.shields.io/badge/unsafe-FFI%20only%20(src%2Focr.rs)-brightgreen.svg)](#security-by-design--verified-by-tests)
+[![Tests: 109 Passing](https://img.shields.io/badge/tests-109%20passing-brightgreen.svg)](#security-by-design--verified-by-tests)
 [![Zero Telemetry](https://img.shields.io/badge/telemetry-none-success.svg)](#why-fast-docs)
 
-Stop feeding your AI assistant outdated APIs, cloud-proxied snippets, or spawning a dozen heavy Node.js processes across agents. `fast-docs` compiles into a **single 9.6 MiB native Rust background daemon** with **zero runtime dependencies**: run **one shared service** on `127.0.0.1:3000/mcp` for every Claude Code session and IDE on your machine (sharing one HTTP/2 connection pool and one disk cache), resolve the **exact dependency versions locked in your repository**, and get cached answers in **under 0.5 ms**.
+Stop feeding your AI assistant outdated APIs, cloud-proxied snippets, or spawning a dozen heavy Node.js processes across agents. `fast-docs` compiles into a **single 9.6 MiB native Rust background daemon** with **zero runtime dependencies** (Apple Silicon Homebrew builds also ship a bundled `libtesseract.dylib` for on-device OCR): run **one shared service** on `127.0.0.1:3000/mcp` for every Claude Code session and IDE on your machine (sharing one HTTP/2 connection pool and one disk cache), resolve the **exact dependency versions locked in your repository**, and get cached answers in **under 0.5 ms**.
 
 ---
 
@@ -19,7 +19,7 @@ Stop feeding your AI assistant outdated APIs, cloud-proxied snippets, or spawnin
 | Slow cloud round-trips, API keys, and rate-limited third-party SaaS | **100% local**, zero API keys, zero accounts, zero telemetry — talks directly to official registries and your local repository |
 | Heavy Node.js / Python / Docker MCP runtimes eating RAM | **5.65 ms** cold start, **0.29 ms** cache hits, **5.2 MiB** peak memory footprint, near-zero CPU |
 | Unbounded HTTP fetches and unguarded local file reads | **Defense-in-depth security**: HTTPS allowlists, DNS-pinned public-IP SSRF guards, anti-DNS-rebinding HTTP transport, 5 MiB streaming caps, anti-zip-bomb & anti-XXE extractors |
-| Private company docs, PDFs, spreadsheets, and notebooks left out | Searches local Markdown, RST, **Jupyter `.ipynb`**, **Word `.docx`**, **PowerPoint `.pptx`**, **Excel `.xlsx`**, **OpenDocument**, **EPUB**, and **PDF** on disk without uploading a single byte |
+| Private company docs, PDFs, spreadsheets, and notebooks left out | Searches local Markdown, RST, **Jupyter `.ipynb`**, **Word `.docx`**, **PowerPoint `.pptx`**, **Excel `.xlsx`**, **OpenDocument**, **EPUB**, **PDF**, and **images** (`.png`, `.jpg`, `.webp`, `.tiff`, `.gif`) through on-device **Tesseract OCR** on Apple Silicon, on disk without uploading a single byte |
 
 ---
 
@@ -36,7 +36,7 @@ Measured on Apple Silicon (`macOS ARM64`, `target/release/fast-docs` v1.0.0 with
 | **Local private repo search** (`fetch_local_docs`, topic ranked) | **1.66 ms** median | On-the-fly scan — zero pre-indexing step, zero vector DB |
 | **Memory footprint** (`peak memory footprint` / max RSS) | **5.2 MiB** / **17.7 MiB** | Includes TLS (`rustls`), `gzip` decompression, and full HTML parsing |
 | **CPU usage** (`/usr/bin/time -l` user + sys on live fetch) | **0.00 s user · 0.00 s sys** | Event-driven async I/O (`tokio`), idles cleanly between MCP tool calls |
-| **Binary size** | **9.6 MiB** | Single self-contained executable (no Node, Python, OpenSSL, or C FFI) |
+| **Binary size** | **9.6 MiB** | Single self-contained executable (no Node, Python, or OpenSSL; Apple Silicon Homebrew builds add a 7.3 MiB `libtesseract.dylib` and the 3.9 MiB `eng.traineddata` in `libexec/`) |
 
 > **Transparency note:** Cold network fetches are bounded by upstream registry latency (~40–350 ms across `docs.rs`, `pypi.org`, `pkg.go.dev`, `unpkg.com`, and `llms.txt` sites). `fast-docs` wins on startup, memory, CPU, parallel search, `gzip` transfer, `ETag` (`304 Not Modified`) revalidation, and sub-millisecond repeat reads.
 
@@ -135,7 +135,7 @@ When looking up library APIs, call `fast-docs` (`fetch_docs` with `project_dir` 
 | **`fetch_docs`** | Fetches version-accurate documentation across **Rust** (`docs.rs`), **Python** (`pypi.org` + RST parser + RSS fallback for >5 MiB packages), **Go** (`pkg.go.dev` README + API docs, vanity imports & stdlib), and **npm/JS/TS** (`unpkg.com` + `registry.npmjs.org` fallback, scoped `@scope/pkg`). | `library`, `version`, `lang`, `module` (supports `::` item paths like `builder::Command` and `sync::mpsc`), `topic`, `project_dir`, `max_chars` (`500..=20000`), `offset` |
 | **`search_docs`** | Searches Rust, Python, Go, and npm registries **in parallel** (`tokio::join!`) with 15-minute caching and exact PyPI package matching even on multi-word queries (`"pytest fixtures"`). | `query`, `lang` (`rust`, `python`, `go`, `npm`, `all`) |
 | **`fetch_llms_txt`** | Fetches and filters official `/llms.txt` or `/llms-full.txt` (auto-fallback on 404, safe per-hop DNS-pinned redirects like `docs.pydantic.dev` → `pydantic.dev`). | `target`, `full`, `topic`, `max_chars`, `offset` |
-| **`fetch_local_docs`** | Searches private repository documentation locally across `.md`, `.mdx`, `.txt`, `.rst`, **`.ipynb`**, **`.docx`**, **`.pptx`**, **`.xlsx`**, **`.odt`**, **`.odp`**, **`.ods`**, **`.epub`**, and **`.pdf`** — prioritizing `README.md` and `docs/` over changelogs. | `project_dir`, `topic`, `max_chars`, `offset` |
+| **`fetch_local_docs`** | Searches private repository documentation locally across `.md`, `.mdx`, `.txt`, `.rst`, **`.ipynb`**, **`.docx`**, **`.pptx`**, **`.xlsx`**, **`.odt`**, **`.odp`**, **`.ods`**, **`.epub`**, and **`.pdf`**, plus images via Tesseract OCR on Apple Silicon Homebrew builds (up to 16 per call, cached by content hash) — prioritizing `README.md` and `docs/` over changelogs. | `project_dir`, `topic`, `max_chars`, `offset` |
 | **`manage_cache`** | Inspects or maintains the local disk cache (`~/.cache/fast-docs/indexes/`). | `action` (`stats`, `prune`, `clear`) |
 
 ### Example Prompts to Try Right Away
@@ -149,7 +149,7 @@ When looking up library APIs, call `fast-docs` (`fetch_docs` with `project_dir` 
 
 ## Security by Design — Verified by Tests
 
-Security is enforced in code and CI, not just in prose. `fast-docs` contains **zero `unsafe` blocks**, **zero `.unwrap()` / `panic!()` calls in production paths**, and enforces strict `clippy::pedantic` + panic-prevention lints in `Cargo.toml`:
+Security is enforced in code and CI, not just in prose. `fast-docs` confines all `unsafe` code to the Tesseract FFI boundary in `src/ocr.rs` (zero `unsafe` blocks in builds without OCR), **zero `.unwrap()` / `panic!()` calls in production paths**, and enforces strict `clippy::pedantic` + panic-prevention lints in `Cargo.toml`:
 
 - **Outbound SSRF & DNS-rebinding defense:**
   - `fetch_docs` and `search_docs` allow HTTPS strictly to 6 pinned registry hosts (`docs.rs`, `pypi.org`, `pkg.go.dev`, `api.github.com`, `registry.npmjs.org`, `unpkg.com`), rejecting non-HTTPS schemes, explicit ports, embedded credentials, path traversal (`..`), and cross-allowlist redirects.
@@ -158,12 +158,12 @@ Security is enforced in code and CI, not just in prose. `fast-docs` contains **z
   - Refuses non-loopback bind addresses (`0.0.0.0`, LAN IPs) by default and enforces `rmcp`'s built-in DNS-rebinding `Host` header validation (`HTTP 403` on hostile `Host` headers).
 - **Resource & DoS caps (OWASP API4:2023 + RFC 9111):**
   - 5 s connect timeout, 10 s total timeout, and a **5 MiB streaming byte cap** enforced on the **decompressed** stream (defeating gzip bombs).
-  - Rich local extractors enforce a 5 MiB raw file cap, 200-entry ZIP limit, **`Read::take` 2 MiB decompressed cap** (anti-zip-bomb), entity-safe XML text extraction without DTD loading (anti-XXE), and `std::panic::catch_unwind` isolation around PDF parsing.
+  - Rich local extractors enforce a 5 MiB raw file cap, 200-entry ZIP limit, **`Read::take` 2 MiB decompressed cap** (anti-zip-bomb), entity-safe XML text extraction without DTD loading (anti-XXE), and `std::panic::catch_unwind` isolation around PDF parsing. Images are decoded in safe Rust (`image`), rejected above 8192 px per side or 16 Mi px from the header before decoding, and OCR text below confidence 60 is dropped.
 - **Local secrets & symlink isolation:**
   - `fetch_local_docs` canonicalizes every file and drops any symlink escaping `project_dir`, while excluding `.env*`, `.git/`, `.github/`, `.ssh/`, `.gnupg/`, `target/`, `node_modules/`, `*.pem`, `*.key`, `id_rsa*`, and `id_ed25519*`.
 - **Automated verification:**
-  - **81 automated tests** (unit, `proptest` property-based tests, local mock-HTTP integration tests, concurrent multi-agent HTTP daemon & `/health` tests, SSRF, zip-bomb, XXE, corrupted PDF, symlink escape, and DNS-rebinding tests).
-  - **32/32 viable mutants caught** by `cargo-mutants` on `src/cache.rs`.
+  - **109 automated tests** on Apple Silicon OCR builds, 94 without OCR (unit, `proptest` property-based tests, local mock-HTTP integration tests, concurrent multi-agent HTTP daemon & `/health` tests, SSRF, zip-bomb, XXE, corrupted PDF, symlink escape, DNS-rebinding, and OCR tests covering fixture text, corrupt/oversized/blank/icon images, the 16-image cap, and cache reads and writes).
+  - **32/32 viable mutants caught** by `cargo-mutants` on `src/cache.rs`, and **83/86** on `src/ocr.rs` across both builds (the 3 survivors are the two `Drop` releases of Tesseract memory and a one-time log warning, which tests cannot observe).
   - **0 warnings** on `cargo clippy --all-targets --all-features -- -D warnings`, **0 RustSec advisories** on `cargo deny check`, **0 findings** on `actionlint` & `zizmor`, and **0 offenses** on `brew style`.
 
 See [`MEMORY.md`](MEMORY.md) (`D-01`–`D-20`) for the empirical measurements and standards (OWASP API4:2023, OWASP SSRF Cheat Sheet, RFC 9111, HTTP Archive Web Almanac, Nielsen's response-time limits) backing every constant.
@@ -202,8 +202,10 @@ See [`MEMORY.md`](MEMORY.md) (`D-01`–`D-20`) for the empirical measurements an
 | `src/llms_txt.rs` | `llms.txt` / `llms-full.txt` URL validator, public-IP SSRF guard, and per-hop DNS-pinned redirect fetcher |
 | `src/local_docs.rs` | Priority-ordered, symlink-safe, secret-excluding local documentation scanner |
 | `src/extractors.rs` | Zip-bomb-safe, XXE-safe, panic-isolated extractors for `.ipynb`, Office, OpenDocument, `.epub`, and `.pdf` |
+| `src/ocr.rs` | Tesseract FFI boundary (only `unsafe` in the crate), image bounds, OCR cache keys, `/health` OCR status |
+| `build.rs` | Links `libtesseract.dylib` and emits `cfg(fast_docs_ocr)` for `--features ocr` on Apple Silicon |
 | `src/http_server.rs` | Loopback-only MCP Streamable HTTP server (`/mcp`) over `rmcp` + `hyper` |
-| `tests/` | 81 tests across 8 integration, property-based (`proptest`), and security suites |
+| `tests/` | Integration, property-based (`proptest`), security, and OCR suites (9 files); `tests/fixtures/ocr/ledger.png` is regenerated by `scripts/generate-ocr-fixture.swift` |
 | `Formula/fast-docs.rb` | Homebrew tap formula with a two-step MCP `initialize` test |
 | `.github/workflows/`, `deny.toml`, `prek.toml` | SHA-pinned CI & clean-build release workflows, supply-chain audit, and local Git hooks |
 
@@ -215,6 +217,9 @@ prek install
 cargo fmt -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
+# Apple Silicon: OCR build and tests (needs `brew install tesseract`, also required by the
+# `--all-features` clippy hook)
+cargo test --features ocr
 cargo build --release
 
 # Supply-chain, mutation, workflow, and Homebrew audits
