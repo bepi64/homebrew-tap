@@ -1,7 +1,11 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
+use bytes::Bytes;
+use http::{header, Method, Response, StatusCode};
+use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
@@ -11,10 +15,61 @@ use rmcp::transport::streamable_http_server::{
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
+use crate::cache::DiskCache;
 use crate::tools::FastDocsServer;
 
-/// Default loopback bind address for `--http` mode.
+/// Default loopback bind address for the background MCP HTTP daemon.
 pub const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:3000";
+
+/// Interval between background cache pruning passes while the daemon runs.
+const DAEMON_PRUNE_INTERVAL: Duration = Duration::from_hours(1);
+
+/// Execution transport mode selected from CLI arguments and environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunMode {
+    /// Persistent background Streamable HTTP daemon (default).
+    Http(String),
+    /// Per-client stdio JSON-RPC mode (`--stdio`).
+    Stdio,
+}
+
+/// Resolve the server transport mode from CLI arguments and optional `FAST_DOCS_BIND` env var.
+///
+/// Defaults to `RunMode::Http` (shared background daemon) unless `--stdio` is explicitly passed.
+#[must_use]
+pub fn parse_cli_mode(args: &[String], env_bind: Option<&str>) -> RunMode {
+    let default_bind = env_bind
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_HTTP_ADDR);
+
+    let mut idx = 1;
+    while idx < args.len() {
+        let arg = args[idx].as_str();
+        if arg == "--stdio" {
+            return RunMode::Stdio;
+        }
+        if arg == "--http" {
+            let bind_addr = args
+                .get(idx + 1)
+                .filter(|next| !next.starts_with('-'))
+                .map_or(default_bind, String::as_str);
+            return RunMode::Http(bind_addr.to_string());
+        }
+        if let Some(bind_addr) = arg.strip_prefix("--http=") {
+            let trimmed = bind_addr.trim();
+            let chosen = if trimmed.is_empty() {
+                default_bind
+            } else {
+                trimmed
+            };
+            return RunMode::Http(chosen.to_string());
+        }
+        idx += 1;
+    }
+
+    RunMode::Http(default_bind.to_string())
+}
 
 /// Parse a bind address and verify it targets a loopback interface (`127.0.0.0/8` or `::1`)
 /// to prevent accidental exposure on LAN/public interfaces.
@@ -34,8 +89,16 @@ pub fn parse_loopback_bind_addr(raw: &str) -> Result<SocketAddr, String> {
     Ok(addr)
 }
 
-/// Spawn the MCP Streamable HTTP server on a loopback address (endpoint `/mcp`) with `rmcp`'s
-/// built-in DNS rebinding protection enabled. Returns the bound `SocketAddr` and a shutdown trigger.
+fn json_response(status: StatusCode, body: &str) -> Response<BoxBody<Bytes, Infallible>> {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from(body.to_string())).boxed())
+        .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()).boxed()))
+}
+
+/// Spawn the shared MCP Streamable HTTP daemon on a loopback address (`POST /mcp` + `GET /health`)
+/// with a shared `FastDocsServer` HTTP/2 connection pool and `rmcp`'s built-in DNS rebinding guard.
 ///
 /// # Errors
 /// Returns an error if `bind_addr` is rejected or binding the TCP listener fails.
@@ -50,8 +113,10 @@ pub async fn spawn_streamable_http_server(
         .local_addr()
         .map_err(|err| format!("failed to inspect local address: {err}"))?;
 
+    // Share one FastDocsServer (and reqwest TLS/HTTP2 connection pool) across all concurrent agents.
+    let shared_server = FastDocsServer::new();
     let service = Arc::new(StreamableHttpService::new(
-        || Ok(FastDocsServer::new()),
+        move || Ok(shared_server.clone()),
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default(),
     ));
@@ -72,7 +137,21 @@ pub async fn spawn_streamable_http_server(
                         let conn_svc = service_fn(move |req| {
                             let svc = Arc::clone(&svc);
                             async move {
-                                Ok::<_, Infallible>(svc.handle(req).await)
+                                let path = req.uri().path();
+                                if path == "/health" && req.method() == Method::GET {
+                                    let payload = format!(
+                                        r#"{{"status":"ok","service":"fast-docs","version":"{}"}}"#,
+                                        env!("CARGO_PKG_VERSION")
+                                    );
+                                    return Ok::<_, Infallible>(json_response(StatusCode::OK, &payload));
+                                }
+                                if path == "/mcp" {
+                                    return Ok::<_, Infallible>(svc.handle(req).await);
+                                }
+                                Ok::<_, Infallible>(json_response(
+                                    StatusCode::NOT_FOUND,
+                                    r#"{"error":"not found; use /mcp or /health"}"#,
+                                ))
                             }
                         });
                         if let Err(err) = http1::Builder::new()
@@ -90,14 +169,31 @@ pub async fn spawn_streamable_http_server(
     Ok((local_addr, tx))
 }
 
-/// Run the MCP Streamable HTTP server until interrupted (Ctrl-C).
+/// Run the shared MCP Streamable HTTP background daemon with hourly cache pruning until
+/// interrupted (`SIGINT` / `Ctrl-C`).
 ///
 /// # Errors
 /// Returns an error if the bind address is invalid or the listener cannot start.
 pub async fn run_streamable_http_server(bind_addr: &str) -> Result<(), String> {
     let (addr, shutdown) = spawn_streamable_http_server(bind_addr).await?;
-    tracing::info!("fast-docs Streamable HTTP MCP server listening on http://{addr}/mcp");
+    tracing::info!(
+        "fast-docs daemon listening on http://{addr}/mcp (health: http://{addr}/health)"
+    );
+
+    let prune_task = tokio::spawn(async {
+        loop {
+            tokio::time::sleep(DAEMON_PRUNE_INTERVAL).await;
+            if let Some(cache) = DiskCache::default_user_cache() {
+                let removed = cache.prune_expired(SystemTime::now());
+                if removed > 0 {
+                    tracing::info!(removed, "pruned expired cache entries");
+                }
+            }
+        }
+    });
+
     let _ = tokio::signal::ctrl_c().await;
+    prune_task.abort();
     let _ = shutdown.send(());
     Ok(())
 }

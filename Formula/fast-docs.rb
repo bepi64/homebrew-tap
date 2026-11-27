@@ -12,6 +12,13 @@ class FastDocs < Formula
     system "cargo", "install", *std_cargo_args
   end
 
+  service do
+    run [opt_bin/"fast-docs", "--http", "127.0.0.1:3000"]
+    keep_alive true
+    log_path var/"log/fast-docs.log"
+    error_log_path var/"log/fast-docs.log"
+  end
+
   test do
     init_req = {
       jsonrpc: "2.0",
@@ -28,7 +35,7 @@ class FastDocs < Formula
       method:  "notifications/initialized",
     }.to_json
 
-    output = pipe_output(bin/"fast-docs", "#{init_req}\n#{initialized_note}\n", 0)
+    output = pipe_output("#{bin}/fast-docs --stdio", "#{init_req}\n#{initialized_note}\n", 0)
     assert_match "fast-docs", output
   end
 end

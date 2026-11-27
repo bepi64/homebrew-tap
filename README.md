@@ -4,10 +4,10 @@
 
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust: 100% Safe](https://img.shields.io/badge/unsafe-0%20blocks-brightgreen.svg)](#security-by-design--verified-by-tests)
-[![Tests: 79 Passing](https://img.shields.io/badge/tests-79%20passing-brightgreen.svg)](#security-by-design--verified-by-tests)
+[![Tests: 81 Passing](https://img.shields.io/badge/tests-81%20passing-brightgreen.svg)](#security-by-design--verified-by-tests)
 [![Zero Telemetry](https://img.shields.io/badge/telemetry-none-success.svg)](#why-fast-docs)
 
-Stop feeding your AI assistant outdated APIs, cloud-proxied snippets, or 150 ms Node.js cold starts. `fast-docs` compiles into a **single 9.6 MiB native binary** with **zero runtime dependencies**, resolves the **exact dependency versions locked in your repository**, caches parsed documentation locally with `ETag` revalidation, and serves both `stdio` and Streamable HTTP MCP clients in **under 0.3 ms** from cache.
+Stop feeding your AI assistant outdated APIs, cloud-proxied snippets, or spawning a dozen heavy Node.js processes across agents. `fast-docs` compiles into a **single 9.6 MiB native Rust background daemon** with **zero runtime dependencies**: run **one shared service** on `127.0.0.1:3000/mcp` for every Claude Code session and IDE on your machine (sharing one HTTP/2 connection pool and one disk cache), resolve the **exact dependency versions locked in your repository**, and get cached answers in **under 0.5 ms**.
 
 ---
 
@@ -44,13 +44,21 @@ Measured on Apple Silicon (`macOS ARM64`, `target/release/fast-docs` v1.0.0 with
 
 ## Quickstart (30 Seconds)
 
-### 1. Install
+### 1. Install & Start the Background Service
 
-**Homebrew (macOS / Linux):**
+**Homebrew (macOS / Linux — recommended):**
 
 ```bash
 brew tap bepi64/tap
 brew install fast-docs
+brew services start fast-docs
+```
+
+Verify the daemon is running:
+
+```bash
+curl -s http://127.0.0.1:3000/health
+# {"status":"ok","service":"fast-docs","version":"1.0.0"}
 ```
 
 **From source (Rust stable):**
@@ -59,42 +67,43 @@ brew install fast-docs
 git clone https://github.com/bepi64/homebrew-tap.git
 cd homebrew-tap
 cargo build --release
-# Binary is at ./target/release/fast-docs
+# Starts the shared background HTTP daemon on http://127.0.0.1:3000/mcp by default
+./target/release/fast-docs
 ```
 
-### 2. Connect to Your AI Assistant
+*(Override the loopback bind address via `--http 127.0.0.1:8080` or `FAST_DOCS_BIND=127.0.0.1:8080`.)*
 
-#### Claude Code (stdio — recommended)
+### 2. Connect Your AI Assistants to the Shared Daemon
+
+One running `fast-docs` process serves **all** your concurrent Claude Code terminals, Cursor windows, and IDE agents with a shared HTTP/2 connection pool and hourly cache pruning:
+
+#### Claude Code (recommended — connects to the shared daemon)
 
 ```bash
-claude mcp add -s user fast-docs -- fast-docs
+claude mcp add -s user --transport http fast-docs http://127.0.0.1:3000/mcp
 ```
 
-*(Behind a corporate HTTPS proxy without custom `rustls` roots, clear proxy variables for the MCP process with `-e HTTP_PROXY= -e HTTPS_PROXY= -e http_proxy= -e https_proxy=`.)*
-
-#### Cursor / Windsurf / Claude Desktop / VS Code (`mcp.json`)
+#### Cursor / Windsurf / VS Code (`mcp.json`)
 
 ```json
 {
   "mcpServers": {
     "fast-docs": {
-      "command": "fast-docs"
+      "url": "http://127.0.0.1:3000/mcp"
     }
   }
 }
 ```
 
-#### Streamable HTTP mode (`--http`)
+#### Alternative: Per-client `stdio` mode (`--stdio`)
 
-Run a persistent loopback-only MCP HTTP server at `http://127.0.0.1:3000/mcp`:
-
-```bash
-fast-docs --http 127.0.0.1:3000
-```
+If you prefer clients to spawn an isolated `stdio` process instead of using the background daemon:
 
 ```bash
-claude mcp add --transport http fast-docs http://127.0.0.1:3000/mcp
+claude mcp add -s user fast-docs -- fast-docs --stdio
 ```
+
+*(Behind a corporate HTTPS proxy without custom `rustls` roots, start the daemon with `HTTP_PROXY= HTTPS_PROXY= http_proxy= https_proxy= fast-docs`.)*
 
 #### Optional: Make Your Agent Use `fast-docs` Automatically
 
@@ -153,7 +162,7 @@ Security is enforced in code and CI, not just in prose. `fast-docs` contains **z
 - **Local secrets & symlink isolation:**
   - `fetch_local_docs` canonicalizes every file and drops any symlink escaping `project_dir`, while excluding `.env*`, `.git/`, `.github/`, `.ssh/`, `.gnupg/`, `target/`, `node_modules/`, `*.pem`, `*.key`, `id_rsa*`, and `id_ed25519*`.
 - **Automated verification:**
-  - **79 automated tests** (unit, `proptest` property-based tests, local mock-HTTP integration tests, SSRF, zip-bomb, XXE, corrupted PDF, symlink escape, and Streamable HTTP DNS-rebinding tests).
+  - **81 automated tests** (unit, `proptest` property-based tests, local mock-HTTP integration tests, concurrent multi-agent HTTP daemon & `/health` tests, SSRF, zip-bomb, XXE, corrupted PDF, symlink escape, and DNS-rebinding tests).
   - **32/32 viable mutants caught** by `cargo-mutants` on `src/cache.rs`.
   - **0 warnings** on `cargo clippy --all-targets --all-features -- -D warnings`, **0 RustSec advisories** on `cargo deny check`, **0 findings** on `actionlint` & `zizmor`, and **0 offenses** on `brew style`.
 

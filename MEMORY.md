@@ -119,6 +119,11 @@ Architecture Decision Records (ADRs) and open questions for `fast-docs` (`homebr
   - Combined `div.UnitReadme-content` + `div.Documentation-content` on `pkg.go.dev`, extracted rustdoc method signatures cleanly (stripping line numbers and preserving `->`), added RST heading/`.. code-block::` parsing, preserved original fence languages, demoted changelog/migration sections, indexed local file paths, excluded `.github/`, and emitted pagination footers from `offset=0`.
   - Added a ~12 KiB `pypi.org/rss/project/<pkg>/releases.xml` fallback when unpinned `/pypi/<pkg>/json` exceeds 5 MiB (e.g. `ruff`), parallel `struct.`/`trait.`/`enum.` fallback for Rust `::` item paths (`builder::Command`, `ser::Serialize`), and cleaner `search_docs` formatting.
 
+### D-20: Daemon-First Shared Background Service Architecture (`127.0.0.1:3000/mcp` + `brew services`)
+- **Status:** Accepted (2026-11-27)
+- **Decision:** Make the persistent loopback Streamable HTTP daemon (`127.0.0.1:3000/mcp`, configurable via `--http` or `FAST_DOCS_BIND`) the default execution mode of `fast-docs`, sharing a single `FastDocsServer` (`reqwest::Client` TLS/HTTP2 pool) across all concurrent MCP clients, adding `GET /health` + hourly `DiskCache::prune_expired` maintenance + Homebrew `service do` in `Formula/fast-docs.rb`, and keeping `stdio` available via `--stdio`.
+- **Rationale:** Running one shared background daemon avoids spawning redundant processes when multiple Claude agents or IDEs run simultaneously, reuses a single HTTP/2 connection pool and disk cache, integrates natively with `brew services start fast-docs` / `launchd`, and preserves strict loopback-only + DNS-rebinding (`HTTP 403`) security.
+
 ## Open Questions
 
 - **Q-01 (v1.0.0 release publication):** `Cargo.toml` and `USER_AGENT` are now at `1.0.0`. Once pushed to GitHub (`https://github.com/bepi64/homebrew-tap`) and tagged `v1.0.0`, replace the placeholder `sha256` in `Formula/fast-docs.rb` with the real release archive checksum, then run `brew audit --strict --new Formula/fast-docs.rb`, `brew install --build-from-source Formula/fast-docs.rb`, and `brew test fast-docs`.

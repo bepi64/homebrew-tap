@@ -508,8 +508,10 @@ dependencies = [
 name = "fast-docs"
 version = "1.0.0"
 dependencies = [
+ "bytes",
  "hex",
  "http",
+ "http-body-util",
  "hyper",
  "hyper-util",
  "pdf-extract",
