@@ -3,3 +3,6 @@
 .env
 .env.*
 .DS_Store
+# cargo-mutants reports
+mutants.out/
+mutants.out.old/
