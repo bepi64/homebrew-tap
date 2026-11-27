@@ -166,7 +166,7 @@ Security is enforced in code and CI, not just in prose. `fast-docs` contains **z
   - **32/32 viable mutants caught** by `cargo-mutants` on `src/cache.rs`.
   - **0 warnings** on `cargo clippy --all-targets --all-features -- -D warnings`, **0 RustSec advisories** on `cargo deny check`, **0 findings** on `actionlint` & `zizmor`, and **0 offenses** on `brew style`.
 
-See [`MEMORY.md`](MEMORY.md) (`D-01`–`D-19`) for the empirical measurements and standards (OWASP API4:2023, OWASP SSRF Cheat Sheet, RFC 9111, HTTP Archive Web Almanac, Nielsen's response-time limits) backing every constant.
+See [`MEMORY.md`](MEMORY.md) (`D-01`–`D-20`) for the empirical measurements and standards (OWASP API4:2023, OWASP SSRF Cheat Sheet, RFC 9111, HTTP Archive Web Almanac, Nielsen's response-time limits) backing every constant.
 
 ---
 
@@ -203,7 +203,7 @@ See [`MEMORY.md`](MEMORY.md) (`D-01`–`D-19`) for the empirical measurements an
 | `src/local_docs.rs` | Priority-ordered, symlink-safe, secret-excluding local documentation scanner |
 | `src/extractors.rs` | Zip-bomb-safe, XXE-safe, panic-isolated extractors for `.ipynb`, Office, OpenDocument, `.epub`, and `.pdf` |
 | `src/http_server.rs` | Loopback-only MCP Streamable HTTP server (`/mcp`) over `rmcp` + `hyper` |
-| `tests/` | 79 tests across 8 integration, property-based (`proptest`), and security suites |
+| `tests/` | 81 tests across 8 integration, property-based (`proptest`), and security suites |
 | `Formula/fast-docs.rb` | Homebrew tap formula with a two-step MCP `initialize` test |
 | `.github/workflows/`, `deny.toml`, `prek.toml` | SHA-pinned CI & clean-build release workflows, supply-chain audit, and local Git hooks |
 
