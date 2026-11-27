@@ -13,7 +13,7 @@ class FastDocs < Formula
       resource "tesseract" do
         url "https://github.com/bepi64/homebrew-tap/releases/download/tesseract-5.5.5/fast-docs-tesseract-5.5.5-aarch64-apple-darwin.tar.gz"
         # Replace with the real archive SHA-256 once tag tesseract-5.5.5 is published on GitHub.
-        sha256 "54b1b9c01f60d87f97d3bc4cbc66710d483153e5c28a5000570bed527429db29"
+        sha256 "dd0fdd4caea5be58238e1d6239d13dfbd4e03b78ce8748e408302d9f6fccda89"
       end
     end
   end
